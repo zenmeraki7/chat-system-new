@@ -1,0 +1,63 @@
+migrations:
+  - id: 001_initial
+    risk: expand-only
+    verification: manual
+  - id: 002_add_whatsapp_fields
+    risk: expand-only
+    verification: manual
+  - id: 003_split_business_domains
+    risk: expand-only
+    verification: manual
+  - id: 004_tenant_rbac_and_secure_channels
+    risk: backfill_required
+    verification: manual
+  - id: 005_add_audit_logs
+    risk: safe_reversible
+    verification: automated
+  - id: 006_tenant_identity_and_ops_foundations
+    risk: expand-only
+    verification: manual
+  - id: 007_business_identity_and_compliance_ops
+    risk: backfill_required
+    verification: manual
+  - id: 008_tenant_safety_and_transfer_controls
+    risk: expand-only
+    verification: manual
+  - id: 009_multibrand_channel_inbox_and_message_identity
+    risk: expand-only
+    verification: manual
+  - id: 010_operational_events_and_controls
+    risk: expand-only
+    verification: manual
+  - id: 011_provider_sync_outbox_and_identity_controls
+    risk: expand-only
+    verification: manual
+  - id: 012_provider_version_rate_limit_and_idempotency
+    risk: expand-only
+    verification: manual
+  - id: 013_org_workspace_agent_and_knowledge_pricing
+    risk: expand-only
+    verification: manual
+  - id: 014_billing_traceability_and_api_clients
+    risk: backfill_required
+    verification: manual
+  - id: 015_provider_retry_and_lifecycle
+    risk: backfill_required
+    verification: manual
+  - id: 016_tenant_boundary_hardening
+    risk: backfill_required
+    verification: manual
+  - id: 017_operational_safety_and_events
+    risk: expand-only
+    verification: manual
+
+workflow:
+  strategy: expand_contract
+  steps:
+    - add_new_table_or_column
+    - dual_write
+    - backfill
+    - dual_read
+    - switch_reads
+    - stop_old_writes
+    - drop_old_columns_later
