@@ -1,6 +1,8 @@
-import { Link, Navigate, Outlet, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { Link, Navigate, Outlet, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { FormEvent, useEffect, useMemo, useState } from "react";
-import { api } from "./api";
+import { API_ORIGIN, api } from "./api";
+import { DataTable, type DataTableColumn } from "./components/DataTable";
+import { normalizeQueryPage, toQueryString, type QueryState } from "./lib/queryContract";
 
 type Campaign = {
   campaign_id: string;
@@ -98,7 +100,126 @@ type WhatsAppSetupDiagnostics = {
   webhook_heartbeat_status: string;
   webhook_heartbeat_lag_seconds?: number | null;
 };
+type AuthLoginResponse = {
+  access_token: string;
+  token_type: string;
+  expires_in: number;
+  memberships?: Array<{ business_id: string; business_name: string; role: string }>;
+};
 
+type MeProfile = {
+  id: string;
+  business_name?: string;
+  status?: string;
+};
+function loadTablePrefs(key: string) {
+  try {
+    return JSON.parse(localStorage.getItem(`table_prefs:${key}`) || "{}") as { sortBy?: string; sortDir?: "asc" | "desc"; pageSize?: number };
+  } catch {
+    return {};
+  }
+}
+
+function saveTablePrefs(key: string, prefs: { sortBy?: string; sortDir?: "asc" | "desc"; pageSize?: number }) {
+  localStorage.setItem(`table_prefs:${key}`, JSON.stringify(prefs));
+}
+
+
+function decodeJwtSubject(token: string): string | null {
+  try {
+    const payload = token.split(".")[1];
+    if (!payload) return null;
+    const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+    const decoded = JSON.parse(atob(normalized));
+    return typeof decoded?.sub === "string" ? decoded.sub : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearAuthStorage() {
+  ["access_token", "token", "auth_token", "jwt", "bearer_token", "current_user_id", "auth_business_name", "auth_business_id"].forEach((k) => localStorage.removeItem(k));
+}
+
+function RequireAuth({ children }: { children: React.ReactNode }) {
+  const location = useLocation();
+  const [checking, setChecking] = useState(true);
+  const [allowed, setAllowed] = useState(false);
+
+  useEffect(() => {
+    const token = localStorage.getItem("access_token") || localStorage.getItem("token") || localStorage.getItem("auth_token") || localStorage.getItem("jwt") || localStorage.getItem("bearer_token");
+    if (!token) {
+      setAllowed(false);
+      setChecking(false);
+      return;
+    }
+    api<MeProfile>("/auth/me")
+      .then((profile) => {
+        if (profile?.business_name) localStorage.setItem("auth_business_name", profile.business_name);
+        if (profile?.id) localStorage.setItem("auth_business_id", profile.id);
+        setAllowed(true);
+      })
+      .catch(() => {
+        clearAuthStorage();
+        setAllowed(false);
+      })
+      .finally(() => setChecking(false));
+  }, []);
+
+  if (checking) return <div className="page"><main><p>Checking session...</p></main></div>;
+  if (!allowed) return <Navigate to="/login" replace state={{ from: location.pathname + location.search }} />;
+  return <>{children}</>;
+}
+
+function LoginPage() {
+  const nav = useNavigate();
+  const location = useLocation();
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setBusy(true);
+    setErr("");
+    try {
+      const result = await api<AuthLoginResponse>("/auth/login", "POST", { email: email.trim(), password });
+      localStorage.setItem("access_token", result.access_token);
+      const subject = decodeJwtSubject(result.access_token);
+      if (subject) {
+        const parts = subject.split(":");
+        if (parts.length === 2) localStorage.setItem("current_user_id", parts[1]);
+      }
+      try {
+        const me = await api<MeProfile>("/auth/me");
+        if (me?.business_name) localStorage.setItem("auth_business_name", me.business_name);
+        if (me?.id) localStorage.setItem("auth_business_id", me.id);
+      } catch {
+        // Ignore secondary profile bootstrap failure; token is already persisted.
+      }
+      const target = (location.state as { from?: string } | null)?.from || "/dashboard";
+      nav(target, { replace: true });
+    } catch (e) {
+      setErr((e as Error).message);
+      clearAuthStorage();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Layout>
+      <h2>Sign In</h2>
+      <form className="stack" onSubmit={onSubmit}>
+        <input type="email" placeholder="Email" value={email} onChange={(e) => setEmail(e.target.value)} required />
+        <input type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)} required />
+        <button disabled={busy}>{busy ? "Signing in..." : "Sign In"}</button>
+      </form>
+      {err ? <p>{err}</p> : null}
+    </Layout>
+  );
+}
 function Layout({ children }: { children: React.ReactNode }) {
   return (
     <div className="page">
@@ -125,7 +246,9 @@ function DashboardPage() {
   const [failedSends, setFailedSends] = useState<any[]>([]);
 
   useEffect(() => {
-    api<Campaign[]>("/campaigns?limit=100").then(setCampaigns).catch(console.error);
+    api<unknown>("/campaigns?limit=100")
+      .then((payload) => setCampaigns(normalizeQueryPage<Campaign>(payload).items))
+      .catch(console.error);
     api<ConversationInboxItem[]>("/conversations?limit=100").then(setConversations).catch(console.error);
   }, []);
 
@@ -138,7 +261,9 @@ function DashboardPage() {
     if (!primaryCampaignId) return;
     api(`/campaigns/${primaryCampaignId}/whatsapp-health`).then(setHealth).catch(console.error);
     api<CampaignAnalytics>(`/campaigns/${primaryCampaignId}/analytics`).then(setAnalytics).catch(console.error);
-    api<any[]>(`/campaigns/${primaryCampaignId}/recipients?status=failed&limit=5`).then(setFailedSends).catch(console.error);
+    api<unknown>(`/campaigns/${primaryCampaignId}/recipients?status=failed&limit=5`)
+      .then((payload) => setFailedSends(normalizeQueryPage<any>(payload).items))
+      .catch(console.error);
   }, [primaryCampaignId]);
 
   const unreadConversations = conversations.filter((c) => (c.unread_count || 0) > 0).length;
@@ -320,6 +445,7 @@ function WhatsAppSetupPage() {
 }
 
 function InboxPage() {
+  const prefs = loadTablePrefs("messages");
   const [filter, setFilter] = useState("All");
   const [conversations, setConversations] = useState<ConversationInboxItem[]>([]);
   const [selectedId, setSelectedId] = useState("");
@@ -331,6 +457,15 @@ function InboxPage() {
   const [assignUserId, setAssignUserId] = useState("");
   const [composer, setComposer] = useState("");
   const [actionMsg, setActionMsg] = useState("");
+  const [messageSearch, setMessageSearch] = useState("");
+  const [messageSortBy, setMessageSortBy] = useState(prefs.sortBy || "created_at");
+  const [messageSortDir, setMessageSortDir] = useState<"asc" | "desc">(prefs.sortDir || "desc");
+  const [messagePageSize, setMessagePageSize] = useState<number>(prefs.pageSize || 100);
+  const [messageCursor, setMessageCursor] = useState("");
+  const [messageNextCursor, setMessageNextCursor] = useState("");
+  useEffect(() => {
+    saveTablePrefs("messages", { sortBy: messageSortBy, sortDir: messageSortDir, pageSize: messagePageSize });
+  }, [messageSortBy, messageSortDir, messagePageSize]);
 
   const loadList = async () => {
     const params = new URLSearchParams({ limit: "100" });
@@ -350,15 +485,27 @@ function InboxPage() {
   useEffect(() => {
     if (!selectedId) return;
     api(`/conversations/${selectedId}`).then(setDetail).catch(console.error);
-    api<AgentMessage[]>(`/conversations/${selectedId}/messages`).then(setMessages).catch(console.error);
+    api<unknown>(`/conversations/${selectedId}/messages?${toQueryString({
+      cursor: messageCursor || undefined,
+      limit: messagePageSize,
+      search: messageSearch,
+      sortBy: messageSortBy,
+      sortDir: messageSortDir,
+    })}`)
+      .then((payload) => {
+        const normalized = normalizeQueryPage<AgentMessage>(payload);
+        setMessages(normalized.items);
+        setMessageNextCursor(normalized.nextCursor || "");
+      })
+      .catch(console.error);
     api<any[]>(`/conversations/${selectedId}/timeline`).then(setTimeline).catch(console.error);
-  }, [selectedId]);
+  }, [selectedId, messageSearch, messageSortBy, messageSortDir, messagePageSize, messageCursor]);
 
   useEffect(() => {
     if (!detail?.visitor_name && !detail?.visitor_email) return;
     const query = encodeURIComponent((detail.visitor_email || detail.visitor_name || "").trim());
-    api<ContactCRMRecord[]>(`/contacts/crm/records?search=${query}&limit=1`)
-      .then((rows) => setContact(rows[0] || null))
+    api<unknown>(`/contacts/crm/records?search=${query}&limit=1`)
+      .then((rows) => setContact(normalizeQueryPage<ContactCRMRecord>(rows).items[0] || null))
       .catch(() => setContact(null));
   }, [detail?.visitor_name, detail?.visitor_email]);
 
@@ -417,6 +564,13 @@ function InboxPage() {
     if (m.status) return String(m.status);
     return "Sent";
   };
+  const messageColumns: DataTableColumn<AgentMessage>[] = [
+    { key: "created_at", title: "Time", sortable: true, render: (m) => new Date(m.created_at).toLocaleString() },
+    { key: "direction", title: "Direction", sortable: true, render: (m) => m.direction },
+    { key: "message_type", title: "Type", sortable: true, render: (m) => m.message_type },
+    { key: "content_text", title: "Message", render: (m) => m.content_text || "(no text payload)" },
+    { key: "status", title: "Status", sortable: true, render: (m) => formatStatus(m) },
+  ];
 
   return (
     <Layout>
@@ -444,18 +598,28 @@ function InboxPage() {
             </div>
           </div>
           <div className="thread-stream">
-            {messages.map((m) => (
-              <article key={m.public_id} className={`msg ${m.direction === "outbound" ? "out" : "in"}`}>
-                <div className="msg-meta">
-                  <span>{m.message_type}</span>
-                  <span>{new Date(m.created_at).toLocaleString()}</span>
-                </div>
-                <p>{m.content_text || "(no text payload)"}</p>
-                {m.attachments?.length ? <p>Media: {m.attachments.map((a) => a.file_name || a.media_type || "file").join(", ")}</p> : null}
-                {m.message_type === "interactive" ? <p>Buttons/lists message</p> : null}
-                <small>{formatStatus(m)}</small>
-              </article>
-            ))}
+            <input placeholder="Search messages" value={messageSearch} onChange={(e) => setMessageSearch(e.target.value)} />
+            <DataTable
+              columns={messageColumns}
+              rows={messages}
+              rowKey={(m) => m.public_id}
+              enableColumnVisibility
+              virtualizedHeight={360}
+              storageKey="messages_table"
+              pageSize={messagePageSize}
+              onPageSizeChange={(size) => { setMessagePageSize(size); setMessageCursor(""); }}
+              sortBy={messageSortBy}
+              sortDir={messageSortDir}
+              onSort={(key) => {
+                if (messageSortBy === key) setMessageSortDir((d) => d === "asc" ? "desc" : "asc");
+                else {
+                  setMessageSortBy(key);
+                  setMessageSortDir("asc");
+                }
+                setMessageCursor("");
+              }}
+            />
+            <button disabled={!messageNextCursor} onClick={() => setMessageCursor(messageNextCursor)}>Next Page</button>
           </div>
           <div className="composer-box">
             <textarea rows={3} placeholder="Type reply..." value={composer} onChange={(e) => setComposer(e.target.value)} />
@@ -495,6 +659,12 @@ function InboxPage() {
 }
 
 function CommandCenterLayout() {
+  const nav = useNavigate();
+  const businessName = localStorage.getItem("auth_business_name") || "Default";
+  const doLogout = () => {
+    clearAuthStorage();
+    nav("/login", { replace: true });
+  };
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -515,9 +685,10 @@ function CommandCenterLayout() {
       </aside>
       <section className="content-shell">
         <div className="top-context">
-          <span>Business: Default</span>
+          <span>Business: {businessName}</span>
           <span>WABA: Default</span>
           <span>Range: Last 7 days</span>
+          <button onClick={doLogout}>Logout</button>
         </div>
         <Outlet />
       </section>
@@ -575,15 +746,40 @@ function mappingTextIsValid(mappingText: string) {
 }
 
 function CampaignListPage() {
+  const prefs = loadTablePrefs("campaigns");
   const [rows, setRows] = useState<Campaign[]>([]);
   const [healthMap, setHealthMap] = useState<Record<string, number>>({});
   const [statusFilter, setStatusFilter] = useState("All");
   const [typeFilter, setTypeFilter] = useState("All");
   const [ownerFilter, setOwnerFilter] = useState("All");
+  const [search, setSearch] = useState("");
+  const [sortBy, setSortBy] = useState(prefs.sortBy || "created_at");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(prefs.sortDir || "desc");
+  const [pageSize, setPageSize] = useState<number>(prefs.pageSize || 50);
+  const [cursor, setCursor] = useState<string>("");
+  const [nextCursor, setNextCursor] = useState<string>("");
   const [busy, setBusy] = useState("");
   const me = localStorage.getItem("current_user_id") || "";
-  useEffect(() => {
-    api<Campaign[]>("/campaigns").then(async (campaigns) => {
+  const loadCampaigns = async (cursorValue?: string) => {
+    const query: QueryState = {
+      cursor: cursorValue || undefined,
+      limit: pageSize,
+      search,
+      sortBy,
+      sortDir,
+      filters: {
+        status: statusFilter === "All" ? undefined : statusFilter.toLowerCase(),
+        type: typeFilter === "All" ? undefined : typeFilter.toLowerCase(),
+        owner: ownerFilter === "Created by me" ? me : undefined,
+      },
+    };
+    const payload = await api<unknown>(`/campaigns?${toQueryString(query)}`);
+    const normalized = normalizeQueryPage<Campaign>(payload);
+    const campaigns = normalized.items;
+    setRows(campaigns);
+    setNextCursor(normalized.nextCursor || "");
+    setCursor(cursorValue || "");
+    await (async () => {
       setRows(campaigns);
       const slice = campaigns.slice(0, 20);
       const entries = await Promise.all(
@@ -597,30 +793,41 @@ function CampaignListPage() {
         })
       );
       setHealthMap(Object.fromEntries(entries));
-    }).catch(console.error);
-  }, []);
+    })();
+  };
 
-  const filtered = rows.filter((r) => {
-    const statusOk = statusFilter === "All" || r.status.toLowerCase() === statusFilter.toLowerCase();
-    const typeVal = (r.template_category || r.type || "").toLowerCase();
-    const typeOk = typeFilter === "All" || typeVal === typeFilter.toLowerCase();
-    const ownerOk = ownerFilter !== "Created by me" || (!!me && r.created_by_user_id === me);
-    return statusOk && typeOk && ownerOk;
-  });
+  useEffect(() => {
+    saveTablePrefs("campaigns", { sortBy, sortDir, pageSize });
+  }, [sortBy, sortDir, pageSize]);
+
+  useEffect(() => {
+    loadCampaigns().catch(console.error);
+  }, [statusFilter, typeFilter, ownerFilter, search, sortBy, sortDir, pageSize]);
+
+  const filtered = rows;
 
   const pct = (num: number, den: number) => (den > 0 ? ((num / den) * 100).toFixed(1) : "0.0");
   const doAction = async (id: string, action: "pause" | "resume" | "cancel") => {
     setBusy(`${action}:${id}`);
     try {
       await api(`/campaigns/${id}/${action}`, "POST");
-      const refreshed = await api<Campaign[]>("/campaigns");
-      setRows(refreshed);
+      await loadCampaigns(cursor);
     } catch (e) {
       alert((e as Error).message);
     } finally {
       setBusy("");
     }
   };
+
+  const campaignColumns: DataTableColumn<Campaign>[] = [
+    { key: "name", title: "Campaign", sortable: true, render: (r) => r.name },
+    { key: "status", title: "Status", sortable: true, render: (r) => r.status },
+    { key: "type", title: "Type", sortable: true, render: (r) => r.type || "-" },
+    { key: "eligible_recipients", title: "Recipients", sortable: true, render: (r) => Number(r.eligible_recipients || r.total_recipients || 0) },
+    { key: "delivered_count", title: "Delivered", sortable: true, render: (r) => Number(r.delivered_count || 0) },
+    { key: "actual_cost", title: "Cost", sortable: true, render: (r) => r.actual_cost != null ? `USD ${Number(r.actual_cost).toFixed(2)}` : "-" },
+    { key: "actions", title: "Actions", render: (r) => <Link to={`/campaigns/${r.campaign_id}`}>View</Link> },
+  ];
 
   const duplicateCampaign = async (c: Campaign) => {
     if (!c.template_id) return alert("Template missing; cannot duplicate this campaign");
@@ -650,8 +857,8 @@ function CampaignListPage() {
         template_id: c.template_id,
         type: "marketing",
       });
-      const refreshed = await api<Campaign[]>("/campaigns");
-      setRows(refreshed);
+      const refreshed = await api<unknown>(`/campaigns?${toQueryString({ limit: pageSize, sortBy, sortDir })}`);
+      setRows(normalizeQueryPage<Campaign>(refreshed).items);
     } catch (e) {
       alert((e as Error).message);
     } finally {
@@ -670,51 +877,28 @@ function CampaignListPage() {
           <button key={t} className={typeFilter === t ? "filter-active" : ""} onClick={() => setTypeFilter(t)}>{t}</button>
         ))}
         <button className={ownerFilter === "Created by me" ? "filter-active" : ""} onClick={() => setOwnerFilter(ownerFilter === "Created by me" ? "All" : "Created by me")}>Created by me</button>
+        <input placeholder="Search campaigns" value={search} onChange={(e) => setSearch(e.target.value)} />
       </div>
-      <div className="campaign-card-grid">
-        {filtered.map((r) => {
-          const audience = Number(r.eligible_recipients || r.total_recipients || 0);
-          const delivered = Number(r.delivered_count || 0);
-          const read = Number(r.read_count || 0);
-          const replied = Number(r.replied_count || 0);
-          const failed = Number(r.failed_count || 0);
-          const deliveredPct = pct(delivered, audience || 1);
-          const readPct = pct(read, Math.max(delivered, 1));
-          const replyPct = pct(replied, Math.max(delivered, 1));
-          const failedPct = pct(failed, audience || 1);
-          const progressPct = pct(delivered + failed, audience || 1);
-          const healthScore = healthMap[r.campaign_id] ?? 0;
-          return (
-            <article key={r.campaign_id} className="campaign-card">
-              <div className="campaign-head">
-                <h3>{r.name}</h3>
-                <span className="status-chip">{r.status}</span>
-              </div>
-              <div className="campaign-metrics">
-                <span>Template</span><strong>{r.template_name || r.template_id || "-"}</strong>
-                <span>Audience</span><strong>{audience}</strong>
-                <span>Scheduled time</span><strong>{r.scheduled_at ? new Date(r.scheduled_at).toLocaleString() : "-"}</strong>
-                <span>Progress</span><strong>{progressPct}%</strong>
-                <span>Delivered %</span><strong>{deliveredPct}%</strong>
-                <span>Read %</span><strong>{readPct}%</strong>
-                <span>Reply %</span><strong>{replyPct}%</strong>
-                <span>Failed %</span><strong>{failedPct}%</strong>
-                <span>Cost</span><strong>{r.actual_cost != null ? `USD ${Number(r.actual_cost).toFixed(2)}` : "-"}</strong>
-                <span>Revenue</span><strong>Not connected</strong>
-                <span>Health score</span><strong>{healthScore}</strong>
-              </div>
-              <div className="campaign-actions">
-                <Link to={`/campaigns/${r.campaign_id}`}>View</Link>
-                <button disabled={busy !== ""} onClick={() => duplicateCampaign(r).catch(console.error)}>Duplicate</button>
-                <button disabled={busy !== ""} onClick={() => doAction(r.campaign_id, "pause").catch(console.error)}>Pause</button>
-                <button disabled={busy !== ""} onClick={() => doAction(r.campaign_id, "resume").catch(console.error)}>Resume</button>
-                <button disabled={busy !== ""} onClick={() => doAction(r.campaign_id, "cancel").catch(console.error)}>Cancel</button>
-                <Link to={`/campaigns/${r.campaign_id}/cost`}>Export report</Link>
-                <button disabled={busy !== ""} onClick={() => createRetarget(r).catch(console.error)}>Create retargeting campaign</button>
-              </div>
-            </article>
-          );
-        })}
+      <DataTable
+        columns={campaignColumns}
+        rows={filtered}
+        rowKey={(r) => r.campaign_id}
+        enableColumnVisibility
+        storageKey="campaigns_table"
+        pageSize={pageSize}
+        onPageSizeChange={setPageSize}
+        sortBy={sortBy}
+        sortDir={sortDir}
+        onSort={(key) => {
+          if (sortBy === key) setSortDir((d) => d === "asc" ? "desc" : "asc");
+          else {
+            setSortBy(key);
+            setSortDir("asc");
+          }
+        }}
+      />
+      <div className="campaign-actions">
+        <button disabled={!nextCursor} onClick={() => loadCampaigns(nextCursor).catch(console.error)}>Next Page</button>
       </div>
     </Layout>
   );
@@ -725,7 +909,7 @@ function CreateWizardPage() {
   const [name, setName] = useState("");
   const [goal, setGoal] = useState("Sales");
   const [phone, setPhone] = useState("");
-  const [category, setCategory] = useState("marketing");
+  const [category, setCategory] = useState<"broadcast" | "followup">("broadcast");
   const [sendMode, setSendMode] = useState("Normal");
   const [templateId, setTemplateId] = useState("");
   const [busy, setBusy] = useState(false);
@@ -739,7 +923,7 @@ function CreateWizardPage() {
         name,
         phone_number_id: phone,
         template_id: templateId,
-        type: category
+        type: category,
       });
       localStorage.setItem(`campaign_wizard_${row.campaign_id}`, JSON.stringify({
         detailsSaved: true,
@@ -762,9 +946,9 @@ function CreateWizardPage() {
         <input placeholder="Campaign Name" value={name} onChange={(e) => setName(e.target.value)} required />
         <input placeholder="Campaign Goal (Sales, Retention, Reactivation)" value={goal} onChange={(e) => setGoal(e.target.value)} required />
         <input placeholder="WhatsApp Phone Number ID" value={phone} onChange={(e) => setPhone(e.target.value)} required />
-        <select value={category} onChange={(e) => setCategory(e.target.value)}>
-          <option value="marketing">Campaign Category: Marketing</option>
-          <option value="utility">Campaign Category: Utility</option>
+        <select value={category} onChange={(e) => setCategory(e.target.value as "broadcast" | "followup")}>
+          <option value="broadcast">Campaign Category: Marketing</option>
+          <option value="followup">Campaign Category: Utility</option>
         </select>
         <select value={sendMode} onChange={(e) => setSendMode(e.target.value)}>
           <option>Normal</option>
@@ -1227,6 +1411,7 @@ function ScheduleLaunchStepPage() {
 }
 
 function CampaignLiveStatusPage() {
+  const prefs = loadTablePrefs("campaign_recipients");
   const { id } = useParams();
   const [state, setState] = useState<any>(null);
   const [analytics, setAnalytics] = useState<any>(null);
@@ -1236,7 +1421,16 @@ function CampaignLiveStatusPage() {
   const [blackbox, setBlackbox] = useState<any[]>([]);
   const [tab, setTab] = useState("all");
   const [recipients, setRecipients] = useState<any[]>([]);
+  const [recipientsCursor, setRecipientsCursor] = useState("");
+  const [recipientsNextCursor, setRecipientsNextCursor] = useState("");
+  const [recipientsPrevCursors, setRecipientsPrevCursors] = useState<string[]>([]);
+  const [recipientSortBy, setRecipientSortBy] = useState(prefs.sortBy || "updated_at");
+  const [recipientSortDir, setRecipientSortDir] = useState<"asc" | "desc">(prefs.sortDir || "desc");
+  const [recipientPageSize, setRecipientPageSize] = useState<number>(prefs.pageSize || 100);
   const [actionMsg, setActionMsg] = useState("");
+  useEffect(() => {
+    saveTablePrefs("campaign_recipients", { sortBy: recipientSortBy, sortDir: recipientSortDir, pageSize: recipientPageSize });
+  }, [recipientSortBy, recipientSortDir, recipientPageSize]);
   useEffect(() => {
     api(`/campaigns/${id}`).then(setState).catch(console.error);
     api(`/campaigns/${id}/analytics`).then(setAnalytics).catch(console.error);
@@ -1246,10 +1440,27 @@ function CampaignLiveStatusPage() {
     api(`/campaigns/${id}/blackbox`).then(setBlackbox).catch(console.error);
   }, [id]);
 
+  const loadRecipients = async (cursorValue?: string) => {
+    const query = toQueryString({
+      cursor: cursorValue || undefined,
+      limit: recipientPageSize,
+      sortBy: recipientSortBy,
+      sortDir: recipientSortDir,
+      filters: { status: tab === "all" ? undefined : tab },
+    });
+    const payload = await api<unknown>(`/campaigns/${id}/recipients?${query}`);
+    const normalized = normalizeQueryPage<any>(payload);
+    setRecipients(normalized.items);
+    setRecipientsCursor(cursorValue || "");
+    setRecipientsNextCursor(normalized.nextCursor || "");
+  };
+
   useEffect(() => {
-    const statusParam = tab === "all" ? "" : `?status=${encodeURIComponent(tab)}`;
-    api<any[]>(`/campaigns/${id}/recipients${statusParam}`).then(setRecipients).catch(console.error);
-  }, [id, tab]);
+    setRecipientsCursor("");
+    setRecipientsNextCursor("");
+    setRecipientsPrevCursors([]);
+    loadRecipients("").catch(console.error);
+  }, [id, tab, recipientSortBy, recipientSortDir, recipientPageSize]);
 
   const doControl = async (action: "pause" | "resume" | "cancel") => {
     setActionMsg(`${action} in progress...`);
@@ -1267,8 +1478,21 @@ function CampaignLiveStatusPage() {
 
   const retryFailed = async () => {
     try {
-      const failed = await api<any[]>(`/campaigns/${id}/recipients?status=failed`);
-      setActionMsg(`Found ${failed.length} failed recipients. Retry endpoint not yet exposed; export/report flow available now.`);
+      const failed = normalizeQueryPage<any>(await api<unknown>(`/campaigns/${id}/recipients?status=failed&limit=500`)).items;
+      if (!failed.length) {
+        setActionMsg("No failed recipients found.");
+        return;
+      }
+      setActionMsg(`Retrying ${failed.length} failed recipients...`);
+      const results = await Promise.allSettled(
+        failed.map((r) => api(`/campaigns/${id}/recipients/${r.id}/transition`, "POST", { to_status: "queued" }))
+      );
+      const ok = results.filter((r) => r.status === "fulfilled").length;
+      const notOk = results.length - ok;
+      setActionMsg(`Retry submitted for ${ok}/${results.length} recipients${notOk ? ` (${notOk} failed)` : ""}.`);
+      await loadRecipients(recipientsCursor || "").catch(console.error);
+      const a = await api(`/campaigns/${id}/analytics`);
+      setAnalytics(a);
     } catch (e) {
       setActionMsg((e as Error).message);
     }
@@ -1277,11 +1501,16 @@ function CampaignLiveStatusPage() {
   const createRetarget = async () => {
     try {
       const campaignMeta = await api<any>(`/campaigns/${id}/launch-confirmation`);
+      const templateId = String(campaignMeta?.template_id || "").trim();
+      if (!templateId) {
+        setActionMsg("Cannot create retargeting campaign: source campaign has no template_id.");
+        return;
+      }
       await api(`/campaigns`, "POST", {
         name: `${campaignMeta?.template_name || "Campaign"} Retargeting`,
         phone_number_id: campaignMeta?.phone_number_id || "",
-        template_id: null,
-        type: "marketing",
+        template_id: templateId,
+        type: "followup",
       });
       setActionMsg("Retargeting draft campaign created.");
     } catch (e) {
@@ -1312,6 +1541,16 @@ function CampaignLiveStatusPage() {
     title: e.event_type || e.new_status || e.kind,
     detail: e.reason || "",
   }))].sort((a, b) => String(b.ts).localeCompare(String(a.ts))).slice(0, 80);
+
+  const recipientColumns: DataTableColumn<any>[] = [
+    { key: "name", title: "Name", render: (r) => r.name || "-" },
+    { key: "phone", title: "Phone", render: (r) => r.phone_e164 || "-" },
+    { key: "status", title: "Status", sortable: true, render: (r) => r.status || "-" },
+    { key: "reason", title: "Reason", render: (r) => r.eligibility_reason || r.eligibility_status || "-" },
+    { key: "sent_at", title: "Sent", sortable: true, render: (r) => r.sent_at ? new Date(r.sent_at).toLocaleString() : "-" },
+    { key: "cost", title: "Cost", render: (r) => r.actual_cost != null ? r.actual_cost : "-" },
+    { key: "error", title: "Error", render: (r) => r.last_error_code || r.last_error_message || "-" },
+  ];
 
   return (
     <Layout>
@@ -1355,36 +1594,46 @@ function CampaignLiveStatusPage() {
           </button>
         ))}
       </div>
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Phone</th>
-            <th>Status</th>
-            <th>Reason</th>
-            <th>Sent time</th>
-            <th>Delivered time</th>
-            <th>Read time</th>
-            <th>Cost</th>
-            <th>Error</th>
-          </tr>
-        </thead>
-        <tbody>
-          {recipients.map((r) => (
-            <tr key={r.id}>
-              <td>{r.name || "-"}</td>
-              <td>{r.phone_e164 || "-"}</td>
-              <td>{r.status}</td>
-              <td>{r.eligibility_reason || r.eligibility_status || "-"}</td>
-              <td>{r.sent_at ? new Date(r.sent_at).toLocaleString() : "-"}</td>
-              <td>{r.delivered_at ? new Date(r.delivered_at).toLocaleString() : "-"}</td>
-              <td>{r.read_at ? new Date(r.read_at).toLocaleString() : "-"}</td>
-              <td>{r.actual_cost != null ? r.actual_cost : "-"}</td>
-              <td>{r.last_error_code || r.last_error_message || "-"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <DataTable
+        columns={recipientColumns}
+        rows={recipients}
+        rowKey={(r) => String(r.id)}
+        enableColumnVisibility
+        virtualizedHeight={360}
+        storageKey="campaign_recipients_table"
+        pageSize={recipientPageSize}
+        onPageSizeChange={setRecipientPageSize}
+        sortBy={recipientSortBy}
+        sortDir={recipientSortDir}
+        onSort={(key) => {
+          if (recipientSortBy === key) setRecipientSortDir((d) => d === "asc" ? "desc" : "asc");
+          else {
+            setRecipientSortBy(key);
+            setRecipientSortDir("asc");
+          }
+        }}
+      />
+      <div className="campaign-actions">
+        <button
+          disabled={recipientsPrevCursors.length === 0}
+          onClick={() => {
+            const prev = recipientsPrevCursors[recipientsPrevCursors.length - 1] || "";
+            setRecipientsPrevCursors((arr) => arr.slice(0, -1));
+            loadRecipients(prev).catch(console.error);
+          }}
+        >
+          Previous Page
+        </button>
+        <button
+          disabled={!recipientsNextCursor}
+          onClick={() => {
+            setRecipientsPrevCursors((arr) => [...arr, recipientsCursor || ""]);
+            loadRecipients(recipientsNextCursor).catch(console.error);
+          }}
+        >
+          Next Page
+        </button>
+      </div>
       <p>Delivered %: {deliveredPct}% | Read %: {readPct}% | Reply %: {replyPct}% | Failed %: {failedPct}%</p>
     </Layout>
   );
@@ -1394,7 +1643,9 @@ function RecipientFailureReportPage() {
   const { id } = useParams();
   const [rows, setRows] = useState<any[]>([]);
   useEffect(() => {
-    api<any[]>(`/campaigns/${id}/recipients?status=failed`).then(setRows).catch(console.error);
+    api<unknown>(`/campaigns/${id}/recipients?status=failed`)
+      .then((payload) => setRows(normalizeQueryPage<any>(payload).items))
+      .catch(console.error);
   }, [id]);
   return (
     <Layout>
@@ -1475,6 +1726,7 @@ function CampaignCostReportPage() {
 }
 
 function ContactsCrmPage() {
+  const prefs = loadTablePrefs("contacts");
   const nav = useNavigate();
   const [rows, setRows] = useState<ContactCRMRecord[]>([]);
   const [filteredRows, setFilteredRows] = useState<ContactCRMRecord[]>([]);
@@ -1500,19 +1752,37 @@ function ContactsCrmPage() {
   const [suppressed, setSuppressed] = useState("");
   const [contactFilter, setContactFilter] = useState("All");
   const [bulkTagValue, setBulkTagValue] = useState("");
+  const [sortBy, setSortBy] = useState(prefs.sortBy || "updated_at");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">(prefs.sortDir || "desc");
+  const [pageSize, setPageSize] = useState<number>(prefs.pageSize || 100);
+  const [cursor, setCursor] = useState("");
+  const [nextCursor, setNextCursor] = useState("");
+  const [prevCursors, setPrevCursors] = useState<string[]>([]);
 
-  const load = async () => {
-    const params = new URLSearchParams();
-    if (search.trim()) params.set("search", search.trim());
-    if (tag.trim()) params.set("tag", tag.trim());
-    if (optInStatus.trim()) params.set("opt_in_status", optInStatus.trim());
-    if (suppressed === "yes") params.set("suppressed", "true");
-    if (suppressed === "no") params.set("suppressed", "false");
-    const data = await api<ContactCRMRecord[]>(`/contacts/crm/records?${params.toString()}`);
-    setRows(data);
-    setFilteredRows(data);
-    if (data.length > 0 && !selectedId) setSelectedId(data[0].id);
+  const load = async (cursorValue?: string) => {
+    const query: QueryState = {
+      cursor: (cursorValue ?? cursor) || undefined,
+      limit: pageSize,
+      sortBy,
+      sortDir,
+      search,
+      filters: {
+        tag,
+        opt_in_status: optInStatus,
+        suppressed: suppressed === "yes" ? true : suppressed === "no" ? false : undefined,
+      },
+    };
+    const data = normalizeQueryPage<ContactCRMRecord>(await api<unknown>(`/contacts/crm/records?${toQueryString(query)}`));
+    setRows(data.items);
+    setFilteredRows(data.items);
+    setCursor((cursorValue ?? cursor) || "");
+    setNextCursor(data.nextCursor || "");
+    if (data.items.length > 0 && !selectedId) setSelectedId(data.items[0].id);
   };
+
+  useEffect(() => {
+    saveTablePrefs("contacts", { sortBy, sortDir, pageSize });
+  }, [sortBy, sortDir, pageSize]);
 
   useEffect(() => {
     load().catch(console.error);
@@ -1691,34 +1961,26 @@ function ContactsCrmPage() {
     }
   };
 
-  const bulkExport = () => {
+  const bulkExport = async () => {
     const selected = filteredRows.filter((r) => selectedIds.has(r.id));
     if (!selected.length) return;
-    const header = ["Name", "Phone", "Tags", "Opt-in status", "Last message", "Last campaign", "Last order", "Total spent", "Warmth score"];
-    const lines = selected.map((r) => {
-      const totalSpent = (r.custom_attributes?.["total_spent"] as string | number | undefined) ?? "";
-      const warmth = (r.custom_attributes?.["warmth_score"] as string | number | undefined) ?? "";
-      return [
-        r.name || "",
-        r.phone_e164 || "",
-        (r.tags || []).join("|"),
-        r.opt_in_status || "",
-        r.last_message_at || "",
-        r.last_campaign_at || "",
-        r.last_order_at || "",
-        String(totalSpent),
-        String(warmth),
-      ].map((v) => `"${String(v).replaceAll("\"", "\"\"")}"`).join(",");
-    });
-    const csv = [header.join(","), ...lines].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "contacts_export.csv";
-    a.click();
-    URL.revokeObjectURL(url);
-    setSaveMsg(`Exported ${selected.length} contacts.`);
+    setSaveMsg("Starting export job...");
+    try {
+      const created = await api<{ job_id: string }>("/contacts/export-jobs", "POST", { contact_ids: selected.map((r) => r.id) });
+      let status = await api<{ status: string; progress?: number; download_url?: string; rows?: number }>(`/contacts/export-jobs/${created.job_id}`);
+      for (let i = 0; i < 12 && status.status !== "completed"; i += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 700));
+        status = await api(`/contacts/export-jobs/${created.job_id}`);
+      }
+      if (status.status === "completed" && status.download_url) {
+        window.open(`${API_ORIGIN}${status.download_url}`, "_blank");
+        setSaveMsg(`Export ready. Rows: ${status.rows || selected.length}`);
+      } else {
+        setSaveMsg(`Export still processing (status: ${status.status}).`);
+      }
+    } catch (e) {
+      setSaveMsg((e as Error).message);
+    }
   };
 
   const bulkCreateCampaign = async () => {
@@ -1727,11 +1989,16 @@ function ContactsCrmPage() {
     setSaveMsg("Creating campaign draft...");
     try {
       const phone = (selected[0]?.custom_attributes?.["default_phone_number_id"] as string | undefined) || "DEFAULT_PHONE_ID";
+      const templateId = String(selected[0]?.custom_attributes?.["default_template_id"] || "").trim();
+      if (!templateId) {
+        setSaveMsg("Cannot create campaign draft: add a valid default_template_id in selected contact custom attributes.");
+        return;
+      }
       await api("/campaigns", "POST", {
         name: `Bulk Contacts Campaign (${selected.length})`,
         phone_number_id: phone,
-        template_id: null,
-        type: "marketing",
+        template_id: templateId,
+        type: "broadcast",
       });
       setSaveMsg("Campaign draft created. Add template and audience source in wizard.");
     } catch (e) {
@@ -1742,8 +2009,35 @@ function ContactsCrmPage() {
   const bulkCreateSegment = async () => {
     const selected = filteredRows.filter((r) => selectedIds.has(r.id));
     if (!selected.length) return;
-    setSaveMsg(`Segment draft staged for ${selected.length} contacts (segment create API not exposed yet).`);
+    setSaveMsg("Creating segment from selected contacts...");
+    try {
+      const segmentTag = `segment_${Date.now()}`;
+      await Promise.all(selected.map(async (r) => {
+        const tags = Array.from(new Set([...(r.tags || []), segmentTag]));
+        await api(`/contacts/${r.id}`, "PATCH", { tags });
+      }));
+      const created = await api<{ segment_id: string }>("/contacts/segments", "POST", {
+        name: `Selected Contacts ${new Date().toISOString().slice(0, 10)}`,
+        visibility: "private",
+        filters: { tags_any: [segmentTag] },
+      });
+      setSaveMsg(`Segment created (${created.segment_id}) for ${selected.length} contacts.`);
+      const segRows = await api<any[]>("/contacts/segments");
+      setSegments(segRows);
+    } catch (e) {
+      setSaveMsg((e as Error).message);
+    }
   };
+
+  const contactColumns: DataTableColumn<ContactCRMRecord>[] = [
+    { key: "name", title: "Name", sortable: true, render: (r) => <a href="#" onClick={(e) => { e.preventDefault(); nav(`/contacts/${r.id}`); }}>{r.name || "-"}</a> },
+    { key: "phone_e164", title: "Phone", sortable: true, render: (r) => r.phone_e164 || "-" },
+    { key: "tags", title: "Tags", render: (r) => (r.tags || []).join(", ") || "-" },
+    { key: "opt_in_status", title: "Opt-in status", sortable: true, render: (r) => r.opt_in_status },
+    { key: "last_message_at", title: "Last message", sortable: true, render: (r) => r.last_message_at ? new Date(r.last_message_at).toLocaleString() : "-" },
+    { key: "last_campaign_at", title: "Last campaign", sortable: true, render: (r) => r.last_campaign_at ? new Date(r.last_campaign_at).toLocaleDateString() : "-" },
+    { key: "last_order_at", title: "Last order", sortable: true, render: (r) => r.last_order_at ? new Date(r.last_order_at).toLocaleDateString() : "-" },
+  ];
 
   return (
     <Layout>
@@ -1759,7 +2053,12 @@ function ContactsCrmPage() {
             <option value="no">Not suppressed</option>
           </select>
         </div>
-        <button onClick={() => load().catch(console.error)}>Search Contacts</button>
+        <button onClick={() => {
+          setCursor("");
+          setNextCursor("");
+          setPrevCursors([]);
+          load("").catch(console.error);
+        }}>Search Contacts</button>
       </div>
       <div className="inbox-filters">
         {["All", "Opted in", "Opted out", "Never messaged", "Recently active", "VIP", "Cold audience", "Clicked campaign", "Replied to campaign", "Purchased", "Abandoned cart"].map((f) => (
@@ -1770,7 +2069,7 @@ function ContactsCrmPage() {
         <input placeholder="tag for bulk add/remove" value={bulkTagValue} onChange={(e) => setBulkTagValue(e.target.value)} />
         <button onClick={() => bulkAddTag().catch(console.error)}>Add tag</button>
         <button onClick={() => bulkRemoveTag().catch(console.error)}>Remove tag</button>
-        <button onClick={bulkExport}>Export</button>
+        <button onClick={() => bulkExport().catch(console.error)}>Export</button>
         <button onClick={() => bulkSuppress().catch(console.error)}>Suppress</button>
         <button onClick={() => bulkCreateCampaign().catch(console.error)}>Create campaign</button>
         <button onClick={() => bulkCreateSegment().catch(console.error)}>Create segment</button>
@@ -1778,38 +2077,61 @@ function ContactsCrmPage() {
       <div className="crm-layout">
         <div>
           <h3>Contact List</h3>
-          <table>
-            <thead>
-              <tr>
-                <th><input type="checkbox" checked={filteredRows.length > 0 && filteredRows.every((r) => selectedIds.has(r.id))} onChange={toggleSelectAllVisible} /></th>
-                <th>Name</th>
-                <th>Phone</th>
-                <th>Tags</th>
-                <th>Opt-in status</th>
-                <th>Last message</th>
-                <th>Last campaign</th>
-                <th>Last order</th>
-                <th>Total spent</th>
-                <th>Warmth score</th>
-              </tr>
-            </thead>
-            <tbody>
-              {filteredRows.map((r) => (
-                <tr key={r.id} onClick={() => setSelectedId(r.id)} style={{ cursor: "pointer", background: selectedId === r.id ? "#eef8ee" : undefined }}>
-                  <td><input type="checkbox" checked={selectedIds.has(r.id)} onChange={() => toggleSelect(r.id)} onClick={(e) => e.stopPropagation()} /></td>
-                  <td><a href="#" onClick={(e) => { e.preventDefault(); nav(`/contacts/${r.id}`); }}>{r.name || "-"}</a></td>
-                  <td>{r.phone_e164 || "-"}</td>
-                  <td>{(r.tags || []).join(", ") || "-"}</td>
-                  <td>{r.opt_in_status}</td>
-                  <td>{r.last_message_at ? new Date(r.last_message_at).toLocaleString() : "-"}</td>
-                  <td>{r.last_campaign_at ? new Date(r.last_campaign_at).toLocaleDateString() : "-"}</td>
-                  <td>{r.last_order_at ? new Date(r.last_order_at).toLocaleDateString() : "-"}</td>
-                  <td>{(r.custom_attributes?.["total_spent"] as string | number | undefined) ?? "Not connected"}</td>
-                  <td>{(r.custom_attributes?.["warmth_score"] as string | number | undefined) ?? (r.last_inbound_at ? "Warm" : "Cold")}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <DataTable
+            columns={contactColumns}
+            rows={filteredRows}
+            rowKey={(r) => r.id}
+            selectedIds={selectedIds}
+            enableColumnVisibility
+            storageKey="contacts_table"
+            pageSize={pageSize}
+            onPageSizeChange={(size) => {
+              setPageSize(size);
+              setCursor("");
+              setNextCursor("");
+              setPrevCursors([]);
+              setTimeout(() => { load("").catch(console.error); }, 0);
+            }}
+            virtualizedHeight={380}
+            onToggleRow={toggleSelect}
+            onToggleAll={toggleSelectAllVisible}
+            allVisibleSelected={filteredRows.length > 0 && filteredRows.every((r) => selectedIds.has(r.id))}
+            sortBy={sortBy}
+            sortDir={sortDir}
+            onSort={(key) => {
+              if (sortBy === key) {
+                setSortDir((d) => d === "asc" ? "desc" : "asc");
+              } else {
+                setSortBy(key);
+                setSortDir("asc");
+              }
+              setCursor("");
+              setNextCursor("");
+              setPrevCursors([]);
+              setTimeout(() => { load("").catch(console.error); }, 0);
+            }}
+          />
+          <div className="campaign-actions">
+            <button
+              disabled={prevCursors.length === 0}
+              onClick={() => {
+                const prev = prevCursors[prevCursors.length - 1] || "";
+                setPrevCursors((arr) => arr.slice(0, -1));
+                load(prev).catch(console.error);
+              }}
+            >
+              Previous Page
+            </button>
+            <button
+              disabled={!nextCursor}
+              onClick={() => {
+                setPrevCursors((arr) => [...arr, cursor || ""]);
+                load(nextCursor).catch(console.error);
+              }}
+            >
+              Next Page
+            </button>
+          </div>
         </div>
         <div>
           <h3>Contact Record</h3>
@@ -2014,7 +2336,8 @@ export default function App() {
   return (
     <Routes>
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
-      <Route element={<CommandCenterLayout />}>
+      <Route path="/login" element={<LoginPage />} />
+      <Route element={<RequireAuth><CommandCenterLayout /></RequireAuth>}>
         <Route path="/dashboard" element={<DashboardPage />} />
         <Route path="/inbox" element={<InboxPage />} />
         <Route path="/contacts" element={<ContactsCrmPage />} />
@@ -2046,3 +2369,9 @@ export default function App() {
     </Routes>
   );
 }
+
+
+
+
+
+

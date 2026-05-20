@@ -6,7 +6,22 @@ import os
 
 from app.config import settings
 from app.database import engine, Base
-from app.api.v1 import auth, business, campaigns, contacts, conversations, public, websocket, whatsapp
+from app.api.v1 import (
+    admin_support,
+    analytics,
+    auth,
+    automations,
+    business,
+    campaigns,
+    commerce,
+    contacts,
+    conversations,
+    public,
+    realtime,
+    templates,
+    websocket,
+    whatsapp,
+)
 from app.services.campaign_batch_dispatch_worker import CampaignBatchDispatchWorker
 from app.services.campaign_dispatch_worker import CampaignDispatchWorker
 from app.services.campaign_finalize_worker import CampaignFinalizeWorker
@@ -79,8 +94,8 @@ app = FastAPI(
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
+    allow_origins=settings.CORS_ORIGINS,
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -98,6 +113,12 @@ app.include_router(business.router, prefix=settings.API_V1_STR)
 app.include_router(conversations.router, prefix=settings.API_V1_STR)
 app.include_router(contacts.router, prefix=settings.API_V1_STR)
 app.include_router(campaigns.router, prefix=settings.API_V1_STR)
+app.include_router(templates.router, prefix=settings.API_V1_STR)
+app.include_router(automations.router, prefix=settings.API_V1_STR)
+app.include_router(commerce.router, prefix=settings.API_V1_STR)
+app.include_router(analytics.router, prefix=settings.API_V1_STR)
+app.include_router(admin_support.router, prefix=settings.API_V1_STR)
+app.include_router(realtime.router, prefix=settings.API_V1_STR)
 app.include_router(public.router, prefix=settings.API_V1_STR)
 app.include_router(whatsapp.router, prefix=settings.API_V1_STR)
 app.include_router(websocket.router)

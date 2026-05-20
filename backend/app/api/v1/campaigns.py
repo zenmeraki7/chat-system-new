@@ -4,13 +4,13 @@ import csv
 import io
 from datetime import datetime, timedelta, timezone
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentActor, require_permissions
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.database import get_db
-from app.models.business_domains import Campaign, CampaignExecutionEvent, CampaignRecipient, CampaignRecipientEvent, CampaignSendJob, CampaignStatusEvent, MessageOutbox, WhatsAppMessageTemplate, WebhookEvent
+from app.models.business_domains import Campaign, CampaignExecutionEvent, CampaignRecipient, CampaignRecipientEvent, CampaignSendJob, CampaignStatusEvent, JobOperation, MessageOutbox, WhatsAppMessageTemplate, WebhookEvent
 from app.models.business import Business
 from app.models.business_domains import WhatsAppPhoneNumber, WhatsAppBusinessAccount, WhatsAppIntegration
 from app.schemas.campaign import (
@@ -90,9 +90,15 @@ async def create_campaign(
     )
 
 
-@router.get("", response_model=list[dict])
+@router.get("", response_model=dict)
 async def list_campaigns(
     status: str | None = Query(default=None),
+    type: str | None = Query(default=None),
+    owner: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    sort_by: str = Query(default="created_at"),
+    sort_dir: str = Query(default="desc"),
     limit: int = Query(default=100, ge=1, le=1000),
     actor: CurrentActor = Depends(require_permissions("campaigns:read")),
     db: AsyncSession = Depends(get_db),
@@ -103,9 +109,48 @@ async def list_campaigns(
     )
     if status:
         stmt = stmt.where(Campaign.status == status.lower())
-    stmt = stmt.order_by(Campaign.created_at.desc(), Campaign.id.desc()).limit(limit)
-    rows = (await db.execute(stmt)).scalars().all()
-    return [
+    if type:
+        stmt = stmt.where(Campaign.type == type.lower())
+    if owner:
+        stmt = stmt.where(Campaign.created_by_user_id == UUID(owner))
+    if search:
+        q = f"%{search.strip()}%"
+        stmt = stmt.where(or_(Campaign.name.ilike(q), Campaign.template_name.ilike(q), Campaign.phone_number_id.ilike(q)))
+    sort_map = {
+        "created_at": Campaign.created_at,
+        "updated_at": Campaign.updated_at,
+        "name": Campaign.name,
+        "status": Campaign.status,
+        "eligible_recipients": Campaign.eligible_recipients,
+        "delivered_count": Campaign.delivered_count,
+        "actual_cost": Campaign.actual_cost,
+    }
+    sort_key = sort_map.get(sort_by, Campaign.created_at)
+    sort_desc = str(sort_dir).lower() != "asc"
+    if cursor:
+        cursor_row = (
+            await db.execute(
+                select(Campaign.id, sort_key).where(
+                    Campaign.id == UUID(cursor),
+                    Campaign.business_id == actor.business.id,
+                    Campaign.deleted_at.is_(None),
+                )
+            )
+        ).first()
+        if cursor_row is not None:
+            cursor_id, cursor_val = cursor_row
+            if cursor_val is not None:
+                if sort_desc:
+                    stmt = stmt.where(or_(sort_key < cursor_val, and_(sort_key == cursor_val, Campaign.id < cursor_id)))
+                else:
+                    stmt = stmt.where(or_(sort_key > cursor_val, and_(sort_key == cursor_val, Campaign.id > cursor_id)))
+    total = int((await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one() or 0)
+    order_primary = sort_key.desc() if sort_desc else sort_key.asc()
+    order_secondary = Campaign.id.desc() if sort_desc else Campaign.id.asc()
+    rows = (await db.execute(stmt.order_by(order_primary, order_secondary).limit(limit + 1))).scalars().all()
+    page_rows = rows[:limit]
+    next_cursor = str(page_rows[-1].id) if len(rows) > limit and page_rows else None
+    items = [
         {
             "campaign_id": str(r.id),
             "name": r.name,
@@ -129,8 +174,9 @@ async def list_campaigns(
             "created_at": r.created_at.isoformat(),
             "updated_at": r.updated_at.isoformat(),
         }
-        for r in rows
+        for r in page_rows
     ]
+    return {"items": items, "next_cursor": next_cursor, "total": total}
 
 
 @router.post("/{campaign_id}/recipient-source", response_model=dict)
@@ -889,10 +935,14 @@ async def list_campaign_send_jobs(
     ]
 
 
-@router.get("/{campaign_id}/recipients", response_model=list[dict])
+@router.get("/{campaign_id}/recipients", response_model=dict)
 async def list_campaign_recipients(
     campaign_id: str,
     status: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    sort_by: str = Query(default="created_at"),
+    sort_dir: str = Query(default="asc"),
     limit: int = Query(default=500, ge=1, le=5000),
     actor: CurrentActor = Depends(require_permissions("campaigns:read")),
     db: AsyncSession = Depends(get_db),
@@ -904,8 +954,42 @@ async def list_campaign_recipients(
     )
     if status:
         stmt = stmt.where(CampaignRecipient.status == status.lower())
-    rows = (await db.execute(stmt.order_by(CampaignRecipient.created_at.asc()).limit(limit))).scalars().all()
-    return [
+    if search:
+        q = f"%{search.strip()}%"
+        stmt = stmt.where(or_(CampaignRecipient.name.ilike(q), CampaignRecipient.phone_e164.ilike(q), CampaignRecipient.status.ilike(q)))
+    sort_map = {
+        "created_at": CampaignRecipient.created_at,
+        "updated_at": CampaignRecipient.updated_at,
+        "sent_at": CampaignRecipient.sent_at,
+        "status": CampaignRecipient.status,
+    }
+    sort_key = sort_map.get(sort_by, CampaignRecipient.created_at)
+    sort_desc = str(sort_dir).lower() != "asc"
+    if cursor:
+        cursor_row = (
+            await db.execute(
+                select(CampaignRecipient.id, sort_key).where(
+                    CampaignRecipient.id == UUID(cursor),
+                    CampaignRecipient.business_id == actor.business.id,
+                    CampaignRecipient.campaign_id == UUID(campaign_id),
+                    CampaignRecipient.deleted_at.is_(None),
+                )
+            )
+        ).first()
+        if cursor_row is not None:
+            cursor_id, cursor_val = cursor_row
+            if cursor_val is not None:
+                if sort_desc:
+                    stmt = stmt.where(or_(sort_key < cursor_val, and_(sort_key == cursor_val, CampaignRecipient.id < cursor_id)))
+                else:
+                    stmt = stmt.where(or_(sort_key > cursor_val, and_(sort_key == cursor_val, CampaignRecipient.id > cursor_id)))
+    total = int((await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one() or 0)
+    order_primary = sort_key.desc() if sort_desc else sort_key.asc()
+    order_secondary = CampaignRecipient.id.desc() if sort_desc else CampaignRecipient.id.asc()
+    rows = (await db.execute(stmt.order_by(order_primary, order_secondary).limit(limit + 1))).scalars().all()
+    page_rows = rows[:limit]
+    next_cursor = str(page_rows[-1].id) if len(rows) > limit and page_rows else None
+    items = [
         {
             "id": str(r.id),
             "name": r.name,
@@ -923,8 +1007,9 @@ async def list_campaign_recipients(
             "read_at": r.read_at.isoformat() if r.read_at else None,
             "failed_at": r.failed_at.isoformat() if r.failed_at else None,
         }
-        for r in rows
+        for r in page_rows
     ]
+    return {"items": items, "next_cursor": next_cursor, "total": total}
 
 
 @router.get("/{campaign_id}/recipient-explainability", response_model=list[dict])
@@ -1430,6 +1515,179 @@ async def export_campaign(
         "download_url": object_storage_service.build_url(key),
         "storage_key": key,
         "rows": len(recipients),
+    }
+
+
+@router.post("/{campaign_id}/export-jobs", response_model=dict)
+async def create_campaign_export_job(
+    campaign_id: str,
+    actor: CurrentActor = Depends(require_permissions("campaigns:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    campaign = (
+        await db.execute(
+            select(Campaign).where(
+                Campaign.id == UUID(campaign_id),
+                Campaign.business_id == actor.business.id,
+                Campaign.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if not campaign:
+        raise NotFoundException("Campaign not found")
+
+    operation_id = f"campaign_export:{campaign.id}:{datetime.now(timezone.utc).isoformat()}"
+    job = JobOperation(
+        business_id=actor.business.id,
+        operation_id=operation_id,
+        actor_user_id=actor.user.id,
+        idempotency_key=operation_id,
+        payload_json={
+            "campaign_id": str(campaign.id),
+            "status": "pending",
+            "progress": 5,
+            "download_url": None,
+            "storage_key": None,
+            "rows": 0,
+        },
+        status="pending",
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return {
+        "job_id": str(job.id),
+        "campaign_id": str(campaign.id),
+        "status": "pending",
+        "progress": 5,
+    }
+
+
+@router.get("/{campaign_id}/export-jobs/{job_id}", response_model=dict)
+async def get_campaign_export_job(
+    campaign_id: str,
+    job_id: str,
+    actor: CurrentActor = Depends(require_permissions("campaigns:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    campaign = (
+        await db.execute(
+            select(Campaign).where(
+                Campaign.id == UUID(campaign_id),
+                Campaign.business_id == actor.business.id,
+                Campaign.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if not campaign:
+        raise NotFoundException("Campaign not found")
+
+    job = (
+        await db.execute(
+            select(JobOperation).where(
+                JobOperation.id == UUID(job_id),
+                JobOperation.business_id == actor.business.id,
+                JobOperation.deleted_at.is_(None),
+            ).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if not job:
+        raise NotFoundException("Export job not found")
+
+    payload = dict(job.payload_json or {})
+    payload_campaign_id = str(payload.get("campaign_id") or "")
+    if payload_campaign_id != str(campaign.id):
+        raise NotFoundException("Export job not found for this campaign")
+
+    # Server-driven progress state machine; job materializes output when polled.
+    if job.status == "pending":
+        payload["status"] = "running"
+        payload["progress"] = 35
+        job.status = "running"
+        job.payload_json = payload
+        await db.commit()
+    elif job.status == "running":
+        recipients = (
+            await db.execute(
+                select(CampaignRecipient).where(
+                    CampaignRecipient.business_id == actor.business.id,
+                    CampaignRecipient.campaign_id == campaign.id,
+                    CampaignRecipient.deleted_at.is_(None),
+                ).order_by(CampaignRecipient.created_at.asc(), CampaignRecipient.id.asc())
+            )
+        ).scalars().all()
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(
+            [
+                "campaign_id",
+                "recipient_id",
+                "phone_e164",
+                "status",
+                "eligibility_status",
+                "eligibility_reason",
+                "provider_message_id",
+                "attempt_count",
+                "sent_at",
+                "delivered_at",
+                "read_at",
+                "failed_at",
+                "last_error_code",
+                "last_error_message",
+            ]
+        )
+        for r in recipients:
+            writer.writerow(
+                [
+                    str(campaign.id),
+                    str(r.id),
+                    r.phone_e164,
+                    r.status,
+                    r.eligibility_status,
+                    r.eligibility_reason or "",
+                    r.provider_message_id or "",
+                    int(r.attempt_count or 0),
+                    r.sent_at.isoformat() if r.sent_at else "",
+                    r.delivered_at.isoformat() if r.delivered_at else "",
+                    r.read_at.isoformat() if r.read_at else "",
+                    r.failed_at.isoformat() if r.failed_at else "",
+                    r.last_error_code or "",
+                    r.last_error_message or "",
+                ]
+            )
+        content = buf.getvalue().encode("utf-8")
+        key = object_storage_service.put_bytes(
+            namespace="campaign_exports",
+            filename_hint=f"campaign_{campaign.id}.csv",
+            content=content,
+        )
+        payload["status"] = "completed"
+        payload["progress"] = 100
+        payload["download_url"] = object_storage_service.build_url(key)
+        payload["storage_key"] = key
+        payload["rows"] = len(recipients)
+        job.status = "completed"
+        job.payload_json = payload
+        await db.commit()
+
+    refreshed = (
+        await db.execute(
+            select(JobOperation).where(
+                JobOperation.id == job.id,
+                JobOperation.business_id == actor.business.id,
+                JobOperation.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    payload = dict(refreshed.payload_json or {})
+    return {
+        "job_id": str(refreshed.id),
+        "campaign_id": str(campaign.id),
+        "status": str(payload.get("status") or refreshed.status),
+        "progress": int(payload.get("progress") or (100 if refreshed.status == "completed" else 5)),
+        "download_url": payload.get("download_url"),
+        "storage_key": payload.get("storage_key"),
+        "rows": int(payload.get("rows") or 0),
     }
 
 

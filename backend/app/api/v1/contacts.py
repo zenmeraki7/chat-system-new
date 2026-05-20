@@ -1,12 +1,14 @@
 import uuid
+import csv
+import io
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, File, UploadFile
-from sqlalchemy import or_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentActor, require_permissions
 from app.database import get_db
-from app.models.business_domains import Contact, ContactSource, ContactMergeEvent, SuppressionListEntry, OutboxEvent
+from app.models.business_domains import Contact, ContactSource, ContactMergeEvent, SuppressionListEntry, OutboxEvent, JobOperation
 from app.models.business_domains import ConversationSavedView, ContactImportJob, ContactImportRow, ContactImportError
 from app.models.business_domains import CampaignRecipient, CampaignRecipientEvent
 from app.models.message import Message, MessageDirection
@@ -29,6 +31,7 @@ from app.services.contact_hygiene_service import contact_hygiene_service
 from app.services.contact_import_service import ContactImportService
 from app.services.contact_import_service import ContactImportService
 from app.services.contact_segment_service import ContactSegmentService
+from app.services.object_storage_service import object_storage_service
 
 router = APIRouter(prefix="/contacts", tags=["Contacts"])
 
@@ -194,13 +197,16 @@ async def list_contacts(
     return [_to_response(r) for r in rows]
 
 
-@router.get("/crm/records", response_model=list[dict])
+@router.get("/crm/records", response_model=dict)
 async def list_contact_crm_records(
     search: str | None = None,
     tag: str | None = None,
     opt_in_status: str | None = None,
     suppressed: bool | None = None,
     segment_id: str | None = None,
+    cursor: str | None = None,
+    sort_by: str = "updated_at",
+    sort_dir: str = "desc",
     limit: int = 200,
     actor: CurrentActor = Depends(require_permissions("contacts:read")),
     db: AsyncSession = Depends(get_db),
@@ -239,11 +245,38 @@ async def list_contact_crm_records(
         ).scalar_one_or_none()
         if seg and isinstance((seg.filters_json or {}).get("filters"), dict):
             stmt = ContactSegmentService(db)._apply_filters(stmt, (seg.filters_json or {}).get("filters") or {})
-    rows = (await db.execute(stmt.order_by(Contact.updated_at.desc(), Contact.id.desc()).limit(max(1, min(limit, 1000))))).scalars().all()
+    sort_key = Contact.updated_at if sort_by == "updated_at" else Contact.created_at
+    sort_desc = str(sort_dir).lower() != "asc"
+    if cursor:
+        cursor_row = (
+            await db.execute(
+                select(Contact.id, Contact.updated_at, Contact.created_at).where(
+                    Contact.id == uuid.UUID(cursor),
+                    Contact.business_id == actor.business.id,
+                    Contact.deleted_at.is_(None),
+                )
+            )
+        ).first()
+        if cursor_row is not None:
+            cursor_id, cursor_updated_at, cursor_created_at = cursor_row
+            cursor_key = cursor_updated_at if sort_by == "updated_at" else cursor_created_at
+            if cursor_key is not None:
+                if sort_desc:
+                    stmt = stmt.where(or_(sort_key < cursor_key, and_(sort_key == cursor_key, Contact.id < cursor_id)))
+                else:
+                    stmt = stmt.where(or_(sort_key > cursor_key, and_(sort_key == cursor_key, Contact.id > cursor_id)))
+
+    total_stmt = select(func.count()).select_from(stmt.subquery())
+    total = int((await db.execute(total_stmt)).scalar_one() or 0)
+    order_primary = sort_key.desc() if sort_desc else sort_key.asc()
+    order_secondary = Contact.id.desc() if sort_desc else Contact.id.asc()
+    rows = (await db.execute(stmt.order_by(order_primary, order_secondary).limit(max(1, min(limit, 1000)) + 1))).scalars().all()
+    page_rows = rows[: max(1, min(limit, 1000))]
+    next_cursor = str(page_rows[-1].id) if len(rows) > max(1, min(limit, 1000)) and page_rows else None
     out: list[dict] = []
-    for row in rows:
+    for row in page_rows:
         out.append(await _build_contact_record(db, actor.business.id, row))
-    return out
+    return {"items": out, "next_cursor": next_cursor, "total": total}
 
 
 @router.get("/tags", response_model=list[dict])
@@ -281,6 +314,117 @@ async def list_contact_custom_fields(
                 continue
             counts[key] = int(counts.get(key, 0)) + 1
     return [{"field": k, "count": v} for k, v in sorted(counts.items(), key=lambda x: (-x[1], x[0]))]
+
+
+@router.post("/export-jobs", response_model=dict)
+async def create_contact_export_job(
+    payload: dict,
+    actor: CurrentActor = Depends(require_permissions("contacts:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    contact_ids = [str(x) for x in (payload.get("contact_ids") or []) if str(x).strip()]
+    operation_id = f"contacts_export:{actor.business.id}:{datetime.now(timezone.utc).isoformat()}"
+    job = JobOperation(
+        business_id=actor.business.id,
+        operation_id=operation_id,
+        actor_user_id=actor.user.id,
+        idempotency_key=operation_id,
+        payload_json={
+            "contact_ids": contact_ids,
+            "status": "pending",
+            "progress": 5,
+            "download_url": None,
+            "storage_key": None,
+            "rows": 0,
+        },
+        status="pending",
+    )
+    db.add(job)
+    await db.commit()
+    await db.refresh(job)
+    return {"job_id": str(job.id), "status": "pending", "progress": 5}
+
+
+@router.get("/export-jobs/{job_id}", response_model=dict)
+async def get_contact_export_job(
+    job_id: str,
+    actor: CurrentActor = Depends(require_permissions("contacts:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    job = (
+        await db.execute(
+            select(JobOperation).where(
+                JobOperation.id == uuid.UUID(job_id),
+                JobOperation.business_id == actor.business.id,
+                JobOperation.deleted_at.is_(None),
+            ).with_for_update()
+        )
+    ).scalar_one_or_none()
+    if not job:
+        return {"job_id": job_id, "status": "not_found"}
+    payload = dict(job.payload_json or {})
+    if job.status == "pending":
+        payload["status"] = "running"
+        payload["progress"] = 35
+        job.status = "running"
+        job.payload_json = payload
+        await db.commit()
+    elif job.status == "running":
+        contact_ids = [uuid.UUID(x) for x in (payload.get("contact_ids") or []) if x]
+        stmt = select(Contact).where(
+            Contact.business_id == actor.business.id,
+            Contact.deleted_at.is_(None),
+        )
+        if contact_ids:
+            stmt = stmt.where(Contact.id.in_(contact_ids))
+        rows = (await db.execute(stmt.order_by(Contact.updated_at.desc(), Contact.id.desc()))).scalars().all()
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["contact_id", "name", "email", "phone_e164", "wa_id", "opt_in_status", "tags", "updated_at"])
+        for r in rows:
+            writer.writerow(
+                [
+                    str(r.id),
+                    r.display_name or "",
+                    r.email or "",
+                    r.normalized_phone or "",
+                    r.wa_id or "",
+                    r.opt_in_status or "",
+                    "|".join(r.tags or []),
+                    r.updated_at.isoformat() if r.updated_at else "",
+                ]
+            )
+        key = object_storage_service.put_bytes(
+            namespace="contact_exports",
+            filename_hint=f"contacts_{actor.business.id}.csv",
+            content=buf.getvalue().encode("utf-8"),
+        )
+        payload["status"] = "completed"
+        payload["progress"] = 100
+        payload["download_url"] = object_storage_service.build_url(key)
+        payload["storage_key"] = key
+        payload["rows"] = len(rows)
+        job.status = "completed"
+        job.payload_json = payload
+        await db.commit()
+    refreshed = (
+        await db.execute(
+            select(JobOperation).where(
+                JobOperation.id == job.id,
+                JobOperation.business_id == actor.business.id,
+                JobOperation.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one()
+    p = dict(refreshed.payload_json or {})
+    return {
+        "job_id": str(refreshed.id),
+        "status": str(p.get("status") or refreshed.status),
+        "progress": int(p.get("progress") or (100 if refreshed.status == "completed" else 5)),
+        "download_url": p.get("download_url"),
+        "storage_key": p.get("storage_key"),
+        "rows": int(p.get("rows") or 0),
+    }
 
 
 @router.get("/{contact_id}/record", response_model=dict)

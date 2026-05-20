@@ -2,7 +2,7 @@ from typing import List
 from datetime import datetime, timezone, timedelta
 from uuid import UUID
 from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import select, delete
+from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
 from app.schemas.conversation import (
@@ -127,9 +127,14 @@ async def get_conversation(
     )
 
 
-@router.get("/{conversation_id}/messages", response_model=List[AgentMessageResponse])
+@router.get("/{conversation_id}/messages", response_model=dict)
 async def get_messages(
     conversation_id: str,
+    search: str | None = Query(default=None),
+    cursor: str | None = Query(default=None),
+    sort_by: str = Query(default="created_at"),
+    sort_dir: str = Query(default="asc"),
+    limit: int = Query(default=100, ge=1, le=1000),
     actor: CurrentActor = Depends(require_permissions("conversations:read")),
     db: AsyncSession = Depends(get_db),
 ):
@@ -140,9 +145,42 @@ async def get_messages(
     if conv.business_id != actor.business.id:
         raise ForbiddenException()
 
-    msg_repo = MessageRepository(db)
-    messages = await msg_repo.get_by_conversation(actor.business.id, UUID(conversation_id))
-    return [
+    from app.models.message import Message
+    stmt = select(Message).where(
+        Message.business_id == actor.business.id,
+        Message.conversation_id == UUID(conversation_id),
+        Message.deleted_at.is_(None),
+    )
+    if search:
+        q = f"%{search.strip()}%"
+        stmt = stmt.where(or_(Message.content_text.ilike(q), Message.content.ilike(q), Message.message_kind.ilike(q)))
+    sort_key = Message.created_at if sort_by == "created_at" else Message.updated_at
+    sort_desc = str(sort_dir).lower() != "asc"
+    if cursor:
+        cursor_row = (
+            await db.execute(
+                select(Message.id, sort_key).where(
+                    Message.id == UUID(cursor),
+                    Message.business_id == actor.business.id,
+                    Message.conversation_id == UUID(conversation_id),
+                    Message.deleted_at.is_(None),
+                )
+            )
+        ).first()
+        if cursor_row is not None:
+            cursor_id, cursor_val = cursor_row
+            if cursor_val is not None:
+                if sort_desc:
+                    stmt = stmt.where(or_(sort_key < cursor_val, and_(sort_key == cursor_val, Message.id < cursor_id)))
+                else:
+                    stmt = stmt.where(or_(sort_key > cursor_val, and_(sort_key == cursor_val, Message.id > cursor_id)))
+    total = int((await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one() or 0)
+    order_primary = sort_key.desc() if sort_desc else sort_key.asc()
+    order_secondary = Message.id.desc() if sort_desc else Message.id.asc()
+    messages = (await db.execute(stmt.order_by(order_primary, order_secondary).limit(limit + 1))).scalars().all()
+    page_rows = messages[:limit]
+    next_cursor = str(page_rows[-1].id) if len(messages) > limit and page_rows else None
+    items = [
         AgentMessageResponse(
             public_id=message.id,
             conversation_public_id=message.conversation_id,
@@ -158,8 +196,9 @@ async def get_messages(
             failed_at=message.failed_at,
             attachments=[],
         )
-        for message in messages
+        for message in page_rows
     ]
+    return {"items": [row.model_dump() for row in items], "next_cursor": next_cursor, "total": total}
 
 
 @router.patch("/{conversation_id}/profile", response_model=ConversationDetailResponse)
