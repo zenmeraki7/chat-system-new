@@ -4,6 +4,8 @@ import { API_ORIGIN, api } from "./api";
 import { DataTable, type DataTableColumn } from "./components/DataTable";
 import { RemoteDataTable } from "./components/RemoteDataTable";
 import { normalizeQueryPage, toQueryString, type QueryState, type SelectionState } from "./lib/queryContract";
+import { appStore, useStoreSelector } from "./state/appStore";
+import { runOptimisticMutation } from "./mutations/optimisticMutations";
 
 type Campaign = {
   campaign_id: string;
@@ -555,7 +557,8 @@ function TemplateApprovalPage() {
     return true;
   });
   const selected = templates.find((t) => t.id === selectedId) || filtered[0] || null;
-  const lastSync = templates.map((t) => t.last_synced_at).filter(Boolean).sort().at(-1);
+  const lastSyncItems = templates.map((t) => t.last_synced_at).filter(Boolean).sort();
+  const lastSync = lastSyncItems.length ? lastSyncItems[lastSyncItems.length - 1] : undefined;
 
   return (
     <div className="template-page">
@@ -1010,31 +1013,43 @@ function InboxPage() {
 
 function InboxReplicaPage() {
   const nav = useNavigate();
-  const [tab, setTab] = useState<"today" | "week">("today");
-  const [conversations, setConversations] = useState<ConversationInboxItem[]>([]);
-  const [selectedId, setSelectedId] = useState("");
   const [detail, setDetail] = useState<any>(null);
-  const [messages, setMessages] = useState<AgentMessage[]>([]);
   const [contact, setContact] = useState<ContactCRMRecord | null>(null);
   const [timeline, setTimeline] = useState<any[]>([]);
-  const [searchText, setSearchText] = useState("");
   const [actionMsg, setActionMsg] = useState("");
+  const conversationEntities = useStoreSelector((s) => s.entities.conversations);
+  const messageEntities = useStoreSelector((s) => s.entities.messages);
+  const selectedId = useStoreSelector((s) => s.ui.inbox.selectedConversationId);
+  const tab = useStoreSelector((s) => s.ui.inbox.tab) as "today" | "week";
+  const searchText = useStoreSelector((s) => s.ui.inbox.search);
+  const conversations = useMemo(() => Object.values(conversationEntities) as ConversationInboxItem[], [conversationEntities]);
+  const messages = useMemo(
+    () => (Object.values(messageEntities) as Array<AgentMessage & { conversation_public_id?: string }>)
+      .filter((m) => String(m.conversation_public_id || "") === selectedId),
+    [messageEntities, selectedId],
+  );
+  const setSelectedId = (id: string) => appStore.setInboxUi({ selectedConversationId: id });
+  const setTab = (nextTab: "today" | "week") => appStore.setInboxUi({ tab: nextTab });
+  const setSearchText = (search: string) => appStore.setInboxUi({ search });
 
   useEffect(() => {
     api<unknown>("/conversations?limit=200")
       .then((payload) => {
         const rows = normalizeQueryPage<ConversationInboxItem>(payload).items;
-        setConversations(rows);
-        if (rows.length && !selectedId) setSelectedId(String(rows[0].public_id));
+        appStore.upsertMany("conversations", rows);
+        if (rows.length && !selectedId) appStore.setInboxUi({ selectedConversationId: String(rows[0].public_id) });
       })
       .catch(console.error);
-  }, []);
+  }, [selectedId]);
 
   useEffect(() => {
     if (!selectedId) return;
     api(`/conversations/${selectedId}`).then(setDetail).catch(console.error);
     api<unknown>(`/conversations/${selectedId}/messages?${toQueryString({ limit: 50, sortBy: "created_at", sortDir: "asc" })}`)
-      .then((payload) => setMessages(normalizeQueryPage<AgentMessage>(payload).items))
+      .then((payload) => {
+        const rows = normalizeQueryPage<AgentMessage>(payload).items;
+        appStore.upsertMany("messages", rows.map((m) => ({ ...m, id: m.public_id, conversation_public_id: selectedId })));
+      })
       .catch(console.error);
     api<any[]>(`/conversations/${selectedId}/timeline`).then(setTimeline).catch(console.error);
   }, [selectedId]);
@@ -1061,6 +1076,7 @@ function InboxReplicaPage() {
   }, [filtered, selectedId]);
 
   const selectedConversation = filtered.find((c) => String(c.public_id) === selectedId) || null;
+  const networkState = useStoreSelector((s) => s.ui.network);
   const initials = (name?: string | null) => {
     const n = (name || "Unknown").trim();
     const parts = n.split(/\s+/).slice(0, 2);
@@ -1080,13 +1096,19 @@ function InboxReplicaPage() {
     const d = await api(`/conversations/${selectedId}`);
     setDetail(d);
     const payload = await api<unknown>("/conversations?limit=200");
-    setConversations(normalizeQueryPage<ConversationInboxItem>(payload).items);
+    appStore.upsertMany("conversations", normalizeQueryPage<ConversationInboxItem>(payload).items);
   };
   const reopenConversation = async () => {
     if (!selectedId) return;
     setActionMsg("Reopening conversation...");
     try {
-      await api(`/conversations/${selectedId}/reopen`, "POST", {});
+      await runOptimisticMutation({
+        entity: "conversations",
+        id: selectedId,
+        optimisticPatch: { status: "open" },
+        rollbackPatch: { status: selectedConversation?.status || "closed" },
+        run: () => api(`/conversations/${selectedId}/reopen`, "POST", {}),
+      });
       setActionMsg("Conversation reopened.");
       await reloadConversation();
     } catch (e) {
@@ -1150,6 +1172,7 @@ function InboxReplicaPage() {
             <span><i className="green-dot" />{filtered.length} resolved today</span>
             <span><span className="star-on">*</span> Avg CSAT: 4.6 / 5</span>
             <span>Avg resolution: 22m</span>
+            {networkState.backpressureWarning ? <span>{networkState.backpressureWarning}</span> : null}
             <span className="resolved-showing">Showing: Today</span>
           </div>
           <div className="content">
