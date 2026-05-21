@@ -127,7 +127,7 @@ class AuthService:
                     {
                         "business_id": business.id,
                         "business_name": business.name,
-                        "role": membership.role.code if membership and membership.role else "member",
+                        "role": (membership.role_code if membership and getattr(membership, "role_code", None) else "member"),
                     }
                 ],
             )

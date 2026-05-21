@@ -56,6 +56,14 @@ class TokenResponse(BaseModel):
     memberships: list[BusinessMembershipSummary] = []
 
 
+class MeProfileResponse(BaseModel):
+    user_id: UUID
+    business_id: UUID
+    business_name: str
+    role: str
+    permissions: list[str] = []
+
+
 class RefreshTokenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

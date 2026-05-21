@@ -30,21 +30,46 @@ from app.services.campaign_quality_guard_worker import CampaignQualityGuardWorke
 from app.services.campaign_scheduler_worker import CampaignSchedulerWorker
 from app.services.billing_finalizer_worker import BillingFinalizerWorker
 from app.services.contact_import_worker import ContactImportWorker
+from app.services.contact_export_worker import ContactExportWorker
 from app.services.message_send_worker import MessageSendWorker
 from app.services.webhook_status_worker import WebhookStatusWorker
 from app.services.webhook_outbox_consumer import WebhookOutboxConsumer
+from app.services.waba_subscription_reconcile_worker import WabaSubscriptionReconcileWorker
+from app.services.whatsapp_phone_registration_worker import WhatsAppPhoneRegistrationWorker
+from app.services.whatsapp_phone_registration_reconcile_worker import WhatsAppPhoneRegistrationReconcileWorker
+from app.services.whatsapp_credential_health_worker import WhatsAppCredentialHealthWorker
 from app.services.outbound_send_worker import OutboundSendWorker
 from app.services.object_storage_service import object_storage_service
+from app.services.template_sync_reconcile_worker import TemplateSyncReconcileWorker
+from app.services.whatsapp_onboarding_health_reconcile_worker import WhatsAppOnboardingHealthReconcileWorker
+from app.services.bulk_job_worker import BulkJobWorker
+
+
+def _validate_startup_configuration() -> None:
+    env = (settings.APP_ENV or "").strip().lower()
+    is_local_env = env in {"local", "dev", "development", "test"}
+    if is_local_env:
+        return
+    required = {
+        "META_APP_ID": str(settings.META_APP_ID or settings.FB_APP_ID or "").strip(),
+        "META_APP_SECRET": str(settings.META_APP_SECRET or settings.FB_APP_SECRET or "").strip(),
+        "META_EMBEDDED_SIGNUP_CONFIG_ID": str(settings.META_EMBEDDED_SIGNUP_CONFIG_ID or "").strip(),
+    }
+    missing = [k for k, v in required.items() if not v]
+    if missing:
+        raise RuntimeError(f"Missing required Meta configuration in non-local environment: {', '.join(missing)}")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _validate_startup_configuration()
     # Create tables on startup (Alembic handles migrations in production)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     webhook_consumer = WebhookOutboxConsumer()
     outbound_worker = OutboundSendWorker()
     contact_import_worker = ContactImportWorker()
+    contact_export_worker = ContactExportWorker()
     campaign_scheduler_worker = CampaignSchedulerWorker()
     campaign_dispatch_worker = CampaignDispatchWorker()
     campaign_batch_dispatch_worker = CampaignBatchDispatchWorker()
@@ -54,9 +79,17 @@ async def lifespan(app: FastAPI):
     billing_finalizer_worker = BillingFinalizerWorker()
     message_send_worker = MessageSendWorker()
     webhook_status_worker = WebhookStatusWorker()
+    waba_subscription_reconcile_worker = WabaSubscriptionReconcileWorker()
+    whatsapp_phone_registration_worker = WhatsAppPhoneRegistrationWorker()
+    whatsapp_phone_registration_reconcile_worker = WhatsAppPhoneRegistrationReconcileWorker()
+    whatsapp_credential_health_worker = WhatsAppCredentialHealthWorker()
+    template_sync_reconcile_worker = TemplateSyncReconcileWorker()
+    whatsapp_onboarding_health_reconcile_worker = WhatsAppOnboardingHealthReconcileWorker()
+    bulk_job_worker = BulkJobWorker()
     await webhook_consumer.start()
     await outbound_worker.start()
     await contact_import_worker.start()
+    await contact_export_worker.start()
     await campaign_scheduler_worker.start()
     await campaign_dispatch_worker.start()
     await campaign_batch_dispatch_worker.start()
@@ -66,7 +99,21 @@ async def lifespan(app: FastAPI):
     await billing_finalizer_worker.start()
     await message_send_worker.start()
     await webhook_status_worker.start()
+    await waba_subscription_reconcile_worker.start()
+    await whatsapp_phone_registration_worker.start()
+    await whatsapp_phone_registration_reconcile_worker.start()
+    await whatsapp_credential_health_worker.start()
+    await template_sync_reconcile_worker.start()
+    await whatsapp_onboarding_health_reconcile_worker.start()
+    await bulk_job_worker.start()
     yield
+    await bulk_job_worker.stop()
+    await whatsapp_onboarding_health_reconcile_worker.stop()
+    await template_sync_reconcile_worker.stop()
+    await whatsapp_credential_health_worker.stop()
+    await whatsapp_phone_registration_reconcile_worker.stop()
+    await whatsapp_phone_registration_worker.stop()
+    await waba_subscription_reconcile_worker.stop()
     await webhook_status_worker.stop()
     await message_send_worker.stop()
     await billing_finalizer_worker.stop()
@@ -77,6 +124,7 @@ async def lifespan(app: FastAPI):
     await campaign_dispatch_worker.stop()
     await campaign_scheduler_worker.stop()
     await contact_import_worker.stop()
+    await contact_export_worker.stop()
     await outbound_worker.stop()
     await webhook_consumer.stop()
     await engine.dispose()
@@ -121,6 +169,7 @@ app.include_router(admin_support.router, prefix=settings.API_V1_STR)
 app.include_router(realtime.router, prefix=settings.API_V1_STR)
 app.include_router(public.router, prefix=settings.API_V1_STR)
 app.include_router(whatsapp.router, prefix=settings.API_V1_STR)
+app.include_router(whatsapp.webhook_alias_router)
 app.include_router(websocket.router)
 
 

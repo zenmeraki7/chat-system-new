@@ -49,6 +49,8 @@ TABLE_CLASSIFICATION = {
     "outbox_events": "tenant_mutable_entity",
     "business_dashboard_stats": "tenant_read_model",
     "oauth_credentials": "tenant_secret_container",
+    "query_snapshots": "tenant_mutable_entity",
+    "contact_export_jobs": "tenant_mutable_entity",
 }
 
 IMMUTABLE_EVENT_TABLE_SUFFIXES = (

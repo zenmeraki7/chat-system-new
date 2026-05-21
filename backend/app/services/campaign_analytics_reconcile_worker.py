@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 
 from app.database import AsyncSessionLocal
 from app.models.business_domains import Campaign, CampaignRecipient
+from app.services.degradation_mode_service import should_defer_domain
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,9 @@ class CampaignAnalyticsReconcileWorker:
 
     async def _run(self) -> None:
         while not self._stop.is_set():
+            if should_defer_domain("analytics"):
+                await asyncio.sleep(self.run_interval_seconds)
+                continue
             try:
                 await self._reconcile_batch()
             except Exception:
@@ -98,4 +102,3 @@ class CampaignAnalyticsReconcileWorker:
                 campaign.actual_cost = float(actual_cost or 0.0)
 
             await db.commit()
-

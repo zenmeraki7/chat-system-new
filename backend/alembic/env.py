@@ -16,7 +16,15 @@ from app.config import settings
 import app.models.registry  # noqa: F401
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.DATABASE_URL.replace("+asyncpg", "+psycopg2"))
+
+
+def _sync_url_from_settings() -> str:
+    # Alembic runs over psycopg2, so normalize asyncpg URL/query params.
+    sync_url = settings.DATABASE_URL.replace("+asyncpg", "+psycopg2")
+    return sync_url.replace("ssl=require", "sslmode=require")
+
+
+config.set_main_option("sqlalchemy.url", _sync_url_from_settings())
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
@@ -44,7 +52,7 @@ def do_run_migrations(connection):
 
 def run_migrations_online() -> None:
     from sqlalchemy import create_engine
-    sync_url = settings.DATABASE_URL.replace("+asyncpg", "+psycopg2")
+    sync_url = _sync_url_from_settings()
     connectable = create_engine(sync_url, poolclass=pool.NullPool)
     with connectable.connect() as connection:
         do_run_migrations(connection)

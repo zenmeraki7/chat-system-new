@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
@@ -9,12 +9,17 @@ from app.api.deps import CurrentActor, require_permissions
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.database import get_db
 from app.models.business_domains import WhatsAppMessageTemplate
+from app.models.business_domains import ProviderSyncRun
 from app.schemas.template import (
     TemplateCreateRequest,
     TemplateResponse,
+    TemplateSyncRequest,
+    TemplateSyncResponse,
+    TemplateSyncRunResponse,
     TemplateStatusUpdateRequest,
     TemplateSummaryResponse,
 )
+from app.services.template_graph_sync_service import TemplateGraphSyncService
 
 router = APIRouter(prefix="/templates", tags=["Templates"])
 
@@ -48,6 +53,26 @@ async def list_templates(
     actor: CurrentActor = Depends(require_permissions("campaigns:read")),
     db: AsyncSession = Depends(get_db),
 ):
+    # Keep template catalog provider-authoritative by opportunistically syncing when empty/stale.
+    latest_sync = (
+        await db.execute(
+            select(func.max(WhatsAppMessageTemplate.last_synced_at)).where(
+                WhatsAppMessageTemplate.business_id == actor.business.id,
+                WhatsAppMessageTemplate.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if latest_sync is None or latest_sync < (datetime.now(timezone.utc) - timedelta(minutes=30)):
+        try:
+            await TemplateGraphSyncService(db).sync_business_templates(
+                business_id=actor.business.id,
+                requested_by_user_id=actor.user.id,
+                trigger="templates_list_auto_sync",
+            )
+        except Exception:
+            # Read path should degrade gracefully; sync failures are tracked in provider sync runs and ledger.
+            await db.rollback()
+
     stmt = select(WhatsAppMessageTemplate).where(
         WhatsAppMessageTemplate.business_id == actor.business.id,
         WhatsAppMessageTemplate.deleted_at.is_(None),
@@ -79,6 +104,15 @@ async def get_template_summary(
     actor: CurrentActor = Depends(require_permissions("campaigns:read")),
     db: AsyncSession = Depends(get_db),
 ):
+    try:
+        await TemplateGraphSyncService(db).sync_business_templates(
+            business_id=actor.business.id,
+            requested_by_user_id=actor.user.id,
+            trigger="templates_summary_auto_sync",
+        )
+    except Exception:
+        await db.rollback()
+
     base = (
         select(WhatsAppMessageTemplate)
         .where(
@@ -209,3 +243,61 @@ async def update_template_status(
     await db.commit()
     await db.refresh(row)
     return _to_template_response(row)
+
+
+@router.post("/sync", response_model=TemplateSyncResponse)
+async def sync_templates_from_graph(
+    payload: TemplateSyncRequest,
+    actor: CurrentActor = Depends(require_permissions("whatsapp:connect")),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await TemplateGraphSyncService(db).sync_business_templates(
+        business_id=actor.business.id,
+        requested_by_user_id=actor.user.id,
+        trigger="manual_endpoint",
+        waba_id=(payload.waba_id.strip() if payload.waba_id else None),
+    )
+    return TemplateSyncResponse(
+        run_id=result.run_id,
+        business_id=result.business_id,
+        status=result.status,
+        waba_ids=result.waba_ids,
+        templates_fetched=result.templates_fetched,
+        templates_upserted=result.templates_upserted,
+        templates_marked_deleted=result.templates_marked_deleted,
+        completed_at=result.completed_at,
+        failure_reason=result.failure_reason,
+    )
+
+
+@router.get("/sync/runs", response_model=list[TemplateSyncRunResponse])
+async def list_template_sync_runs(
+    limit: int = Query(default=20, ge=1, le=100),
+    actor: CurrentActor = Depends(require_permissions("whatsapp:connect")),
+    db: AsyncSession = Depends(get_db),
+):
+    rows = (
+        await db.execute(
+            select(ProviderSyncRun)
+            .where(
+                ProviderSyncRun.business_id == actor.business.id,
+                ProviderSyncRun.provider == "meta",
+                ProviderSyncRun.sync_type == "whatsapp_templates",
+                ProviderSyncRun.deleted_at.is_(None),
+            )
+            .order_by(ProviderSyncRun.created_at.desc())
+            .limit(limit)
+        )
+    ).scalars().all()
+    return [
+        TemplateSyncRunResponse(
+            run_id=r.id,
+            provider=r.provider,
+            sync_type=r.sync_type,
+            status=r.status,
+            started_at=r.started_at,
+            completed_at=r.completed_at,
+            failure_reason=r.failure_reason,
+        )
+        for r in rows
+    ]

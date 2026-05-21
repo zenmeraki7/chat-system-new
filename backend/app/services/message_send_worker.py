@@ -5,10 +5,11 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import case, func, select
 
 from app.database import AsyncSessionLocal
 from app.domain.status_enums import CampaignRecipientStatus, CampaignStatus
+from app.models.business import Business
 from app.models.business_domains import (
     Campaign,
     CampaignRecipient,
@@ -24,6 +25,9 @@ from app.services.whatsapp_messaging_service import WhatsAppMessagingService
 from app.services.whatsapp_client import WhatsAppClientError
 from app.services.campaign_blackbox_recorder import CampaignBlackBoxRecorder
 from app.services.campaign_pause_service import CampaignPauseService
+from app.services.queue_routing_service import worker_region_normalized
+from app.services.tenant_rate_orchestrator_service import TenantRateOrchestratorService
+from app.services.observability_metrics import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -91,13 +95,17 @@ class MessageSendWorker:
 
     async def _resolve_parallelism(self) -> int:
         now = datetime.now(timezone.utc)
+        region = worker_region_normalized()
         async with AsyncSessionLocal() as db:
+            region_clause = True if region == "global" else func.upper(Business.data_region) == region.upper()
             pending_q = await db.execute(
                 select(MessageOutbox.id)
+                .join(Business, Business.id == MessageOutbox.business_id)
                 .where(
                     MessageOutbox.status == "pending",
                     (MessageOutbox.next_retry_at.is_(None) | (MessageOutbox.next_retry_at <= now)),
                     MessageOutbox.deleted_at.is_(None),
+                    region_clause,
                 )
                 .limit(200)
             )
@@ -112,16 +120,27 @@ class MessageSendWorker:
 
     async def _process_one(self) -> bool:
         now = datetime.now(timezone.utc)
+        region = worker_region_normalized()
         async with AsyncSessionLocal() as db:
+            region_clause = True if region == "global" else func.upper(Business.data_region) == region.upper()
             outbox_row = await db.execute(
                 select(MessageOutbox)
+                .join(Business, Business.id == MessageOutbox.business_id)
                 .where(
                     MessageOutbox.status == "pending",
                     MessageOutbox.scheduled_at <= now,
                     (MessageOutbox.next_retry_at.is_(None) | (MessageOutbox.next_retry_at <= now)),
                     MessageOutbox.deleted_at.is_(None),
+                    region_clause,
                 )
                 .order_by(
+                    case(
+                        (MessageOutbox.source_type.in_(["otp", "inbox_reply", "support_reply"]), 0),
+                        (MessageOutbox.source_type.in_(["utility", "order_update", "transactional"]), 1),
+                        (MessageOutbox.source_type.in_(["automation", "workflow"]), 2),
+                        (MessageOutbox.source_type.in_(["campaign_test", "campaign", "campaign_retry"]), 3),
+                        else_=4,
+                    ).asc(),
                     MessageOutbox.priority.asc(),
                     MessageOutbox.scheduled_at.asc(),
                     MessageOutbox.created_at.asc(),
@@ -226,6 +245,49 @@ class MessageSendWorker:
                     await db.commit()
                     return True
 
+            orchestration = await TenantRateOrchestratorService(db).evaluate(
+                business_id=outbox.business_id,
+                phone_number_id=outbox.phone_number_id,
+                source_type=outbox.source_type,
+            )
+            source_type = str(outbox.source_type or "unknown")
+            business_tag = str(outbox.business_id)
+            if not orchestration.allowed:
+                metrics.increment(
+                    "whatsapp_send_orchestration_decision_total",
+                    tags={
+                        "decision": "blocked",
+                        "reason": str(orchestration.reason or "unknown"),
+                        "source_type": source_type,
+                        "business_id": business_tag,
+                    },
+                )
+                if outbox.campaign_id is not None and campaign is not None:
+                    await CampaignBlackBoxRecorder(db).record(
+                        business_id=outbox.business_id,
+                        campaign_id=campaign.id,
+                        event_type="send_orchestration_backoff",
+                        message=f"Orchestrator deferred send by {int(orchestration.retry_after_seconds)}s",
+                        payload_json={
+                            "reason": orchestration.reason,
+                            "retry_after_seconds": int(orchestration.retry_after_seconds),
+                            "phone_number_id": outbox.phone_number_id,
+                            "source_type": outbox.source_type,
+                        },
+                    )
+                outbox.next_retry_at = now + timedelta(seconds=max(1, int(orchestration.retry_after_seconds)))
+                await db.commit()
+                return True
+            metrics.increment(
+                "whatsapp_send_orchestration_decision_total",
+                tags={
+                    "decision": "allowed",
+                    "reason": str(orchestration.reason or "none"),
+                    "source_type": source_type,
+                    "business_id": business_tag,
+                },
+            )
+
             throttle = await rate_limiter_service.check_send_limits(
                 business_id=str(outbox.business_id),
                 phone_number_id=outbox.phone_number_id,
@@ -234,8 +296,18 @@ class MessageSendWorker:
                 contact_id=(str(recipient.contact_id) if recipient and recipient.contact_id else None),
                 is_retry=int(outbox.attempt_count or 0) > 0,
                 template_category=(campaign.template_category if campaign else None),
+                throughput_multiplier=orchestration.throughput_multiplier,
             )
             if not throttle.allowed:
+                metrics.increment(
+                    "whatsapp_send_rate_limit_decision_total",
+                    tags={
+                        "decision": "blocked",
+                        "blocked_by": str(throttle.blocked_by or "unknown"),
+                        "source_type": source_type,
+                        "business_id": business_tag,
+                    },
+                )
                 if outbox.campaign_id is not None and campaign is not None:
                     campaign_key = str(outbox.campaign_id)
                     self._campaign_rate_limit_hits[campaign_key] = int(self._campaign_rate_limit_hits.get(campaign_key, 0)) + 1
@@ -270,11 +342,22 @@ class MessageSendWorker:
                         payload_json={
                             "retry_after_seconds": int(throttle.retry_after_seconds),
                             "phone_number_id": outbox.phone_number_id,
+                            "blocked_by": throttle.blocked_by,
+                            "source_type": outbox.source_type,
                         },
                     )
                 outbox.next_retry_at = now + timedelta(seconds=max(1, int(throttle.retry_after_seconds)))
                 await db.commit()
                 return True
+            metrics.increment(
+                "whatsapp_send_rate_limit_decision_total",
+                tags={
+                    "decision": "allowed",
+                    "blocked_by": "none",
+                    "source_type": source_type,
+                    "business_id": business_tag,
+                },
+            )
             if outbox.campaign_id is not None:
                 self._campaign_rate_limit_hits[str(outbox.campaign_id)] = 0
 
@@ -403,9 +486,12 @@ class MessageSendWorker:
                         outbox.status = "unknown"
                         outbox.next_retry_at = None
                     elif retryable and int(outbox.attempt_count or 0) < self.max_attempts:
+                        retry_base = min(300, 2 ** int(outbox.attempt_count or 1))
+                        if exc.status_code == 429:
+                            retry_base = min(600, max(retry_base, 30))
                         outbox.status = "pending"
                         outbox.next_retry_at = datetime.now(timezone.utc) + timedelta(
-                            seconds=min(300, 2 ** int(outbox.attempt_count or 1))
+                            seconds=retry_base
                         )
                     else:
                         outbox.status = "failed"

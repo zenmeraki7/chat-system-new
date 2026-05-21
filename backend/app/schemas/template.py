@@ -44,3 +44,32 @@ class TemplateSummaryResponse(BaseModel):
     pending_or_in_review: int
     rejected_or_paused: int
     draft_or_unknown: int
+
+
+class TemplateSyncRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    waba_id: str | None = Field(default=None, max_length=255)
+
+
+class TemplateSyncResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: uuid.UUID
+    business_id: uuid.UUID
+    status: str
+    waba_ids: list[str]
+    templates_fetched: int
+    templates_upserted: int
+    templates_marked_deleted: int
+    completed_at: datetime
+    failure_reason: str | None = None
+
+
+class TemplateSyncRunResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    run_id: uuid.UUID
+    provider: str
+    sync_type: str
+    status: str
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    failure_reason: str | None = None

@@ -23,6 +23,7 @@ from app.models.business_domains import (
     WhatsAppChannel,
 )
 from app.core.security import hash_token
+from app.core.exceptions import ConflictException
 from app.services.token_crypto_service import token_crypto_service
 from app.repositories.api_key_repo import ApiKeyRepository
 
@@ -269,16 +270,26 @@ class BusinessRepository:
 
     async def resolve_webhook_tenant(self, waba_id: str, phone_number_id: str) -> tuple[Optional[Business], Optional[str]]:
         business_res = await self.db.execute(
-            select(Business)
+            select(Business.id)
             .join(WhatsAppBusinessAccount, WhatsAppBusinessAccount.business_id == Business.id)
             .join(WhatsAppPhoneNumber, WhatsAppPhoneNumber.business_id == Business.id)
             .where(
                 WhatsAppBusinessAccount.waba_id == waba_id,
                 WhatsAppPhoneNumber.phone_number_id == phone_number_id,
                 WhatsAppPhoneNumber.disconnected_at.is_(None),
+                WhatsAppPhoneNumber.deleted_at.is_(None),
+                WhatsAppBusinessAccount.deleted_at.is_(None),
+                Business.deleted_at.is_(None),
             )
+            .distinct()
+            .limit(2)
         )
-        business = business_res.scalar_one_or_none()
+        business_ids = list(business_res.scalars().all())
+        if not business_ids:
+            return None, None
+        if len(business_ids) > 1:
+            raise ConflictException("Ambiguous webhook tenant mapping for WABA + phone number")
+        business = await self.get_by_id(business_ids[0])
         if not business:
             return None, None
 
@@ -289,10 +300,15 @@ class BusinessRepository:
                 Channel.business_id == business.id,
                 WhatsAppChannel.waba_id == waba_id,
                 WhatsAppChannel.phone_number_id == phone_number_id,
+                Channel.deleted_at.is_(None),
+                WhatsAppChannel.deleted_at.is_(None),
             )
-            .limit(1)
+            .limit(2)
         )
-        channel_id = channel_res.scalars().first()
+        channel_ids = list(channel_res.scalars().all())
+        if len(channel_ids) > 1:
+            raise ConflictException("Ambiguous webhook channel mapping for WABA + phone number")
+        channel_id = channel_ids[0] if channel_ids else None
         return business, str(channel_id) if channel_id else None
 
     async def get_webhook_subscription_by_token(self, provider: str, verify_token: str) -> Optional[WebhookSubscription]:

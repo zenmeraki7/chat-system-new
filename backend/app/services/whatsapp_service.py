@@ -100,4 +100,27 @@ class WhatsAppService:
             response.raise_for_status()
             return response.json()
 
+    async def register_phone_number(self, phone_number_id: str, token: str, api_version: str | None = None):
+        version = api_version or settings.META_GRAPH_API_VERSION or "v21.0"
+        url = f"{self.base_url}/{version}/{phone_number_id}/register"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        payload: dict[str, str] = {"messaging_product": "whatsapp"}
+        pin = (settings.WHATSAPP_PHONE_REGISTRATION_PIN or "").strip()
+        if pin:
+            payload["pin"] = pin
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            return response.json()
+
+    async def get_phone_number_operational_profile(self, phone_number_id: str, token: str, api_version: str | None = None):
+        version = api_version or settings.META_GRAPH_API_VERSION or "v21.0"
+        url = f"{self.base_url}/{version}/{phone_number_id}"
+        headers = {"Authorization": f"Bearer {token}"}
+        params = {"fields": "id,display_phone_number,verified_name,quality_rating,messaging_limit_tier,code_verification_status,status,platform_type"}
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            return response.json()
+
 whatsapp_service = WhatsAppService()

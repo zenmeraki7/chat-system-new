@@ -1,6 +1,7 @@
 from typing import List
 from datetime import datetime, timezone, timedelta
 from uuid import UUID
+import base64
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -42,12 +43,28 @@ from app.models.business_domains import (
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
 
 
-@router.get("", response_model=List[ConversationInboxItemResponse])
+def _encode_conversation_cursor(last_message_at: datetime, conversation_id: UUID) -> str:
+    # Cursor format: "<iso8601>|<uuid>" encoded as URL-safe base64.
+    raw = f"{last_message_at.astimezone(timezone.utc).isoformat()}|{conversation_id}"
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("utf-8")
+
+
+def _decode_conversation_cursor(cursor: str) -> tuple[datetime, UUID] | None:
+    try:
+        decoded = base64.urlsafe_b64decode(cursor.encode("utf-8")).decode("utf-8")
+        ts_raw, id_raw = decoded.split("|", 1)
+        ts = datetime.fromisoformat(ts_raw)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (ts.astimezone(timezone.utc), UUID(id_raw))
+    except Exception:
+        return None
+
+
+@router.get("", response_model=dict)
 async def list_conversations(
-    skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=100),
-    cursor_last_message_at: datetime | None = Query(default=None),
-    cursor_id: UUID | None = Query(default=None),
+    cursor: str | None = Query(default=None),
     status: str | None = Query(default=None),
     assigned_user_id: UUID | None = Query(default=None),
     priority: str | None = Query(default=None),
@@ -56,10 +73,19 @@ async def list_conversations(
     actor: CurrentActor = Depends(require_permissions("conversations:read")),
     db: AsyncSession = Depends(get_db),
 ):
+    cursor_last_message_at: datetime | None = None
+    cursor_id: UUID | None = None
+    if cursor:
+        parsed_cursor = _decode_conversation_cursor(cursor)
+        if parsed_cursor is None:
+            raise HTTPException(status_code=400, detail="Invalid cursor")
+        cursor_last_message_at, cursor_id = parsed_cursor
+
     repo = ConversationRepository(db)
+    fetch_limit = max(1, min(limit, 100)) + 1
     conversations = await repo.list_for_business(
         business_id=actor.business.id,
-        limit=limit,
+        limit=fetch_limit,
         cursor_last_message_at=cursor_last_message_at,
         cursor_id=cursor_id,
         status=status,
@@ -69,9 +95,17 @@ async def list_conversations(
         search=search,
     )
 
+    page_rows = conversations[:limit]
+    has_more = len(conversations) > limit
+    next_cursor = None
+    if has_more and page_rows:
+        last = page_rows[-1]
+        if last.last_message_at is not None:
+            next_cursor = _encode_conversation_cursor(last.last_message_at, last.id)
+
     msg_repo = MessageRepository(db)
     result = []
-    for conv in conversations:
+    for conv in page_rows:
         count = await msg_repo.count_by_conversation(actor.business.id, conv.id)
         tag_rows = await db.execute(
             select(ConversationTag.tag).where(
@@ -97,7 +131,7 @@ async def list_conversations(
                 updated_at=conv.updated_at,
             )
         )
-    return result
+    return {"items": [row.model_dump() for row in result], "next_cursor": next_cursor}
 
 
 @router.get("/{conversation_id}", response_model=ConversationDetailResponse)

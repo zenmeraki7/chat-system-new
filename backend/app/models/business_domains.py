@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
-from sqlalchemy import String, Text, ForeignKey, DateTime, text, UniqueConstraint, ForeignKeyConstraint
+from sqlalchemy import String, Text, ForeignKey, DateTime, text, UniqueConstraint, ForeignKeyConstraint, Index, event
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from app.models.base import BaseModel
@@ -425,6 +425,50 @@ class WebhookDeadLetter(BaseModel):
         UUID(as_uuid=True), ForeignKey("webhook_events.id", ondelete="CASCADE"), nullable=False, unique=True, index=True
     )
     reason: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class PhoneRegistrationAttempt(BaseModel):
+    __tablename__ = "phone_registration_attempts"
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    phone_number_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    waba_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    onboarding_operation_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    outbox_event_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("outbox_events.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    attempt_number: Mapped[int] = mapped_column(nullable=False, default=1)
+    result_status: Mapped[str] = mapped_column(String(30), nullable=False)
+    http_status_code: Mapped[int | None] = mapped_column(nullable=True)
+    provider_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    provider_error_subcode: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    response_payload_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error_payload_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+
+class OnboardingEventLedger(BaseModel):
+    __tablename__ = "onboarding_event_ledger"
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    operation_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    event_type: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    event_status: Mapped[str] = mapped_column(String(30), nullable=False, default="info")
+    merchant_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    waba_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    phone_number_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    meta_app_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    graph_api_endpoint: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    graph_request_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    graph_error_code: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    graph_error_subcode: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    fbtrace_id: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    graph_response_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class Campaign(BaseModel):
@@ -1206,6 +1250,11 @@ class ContactDeduplicationKey(BaseModel):
 
 class Contact(BaseModel):
     __tablename__ = "contacts"
+    __table_args__ = (
+        Index("ix_contacts_business_updated_id", "business_id", "updated_at", "id"),
+        Index("ix_contacts_business_phone", "business_id", "normalized_phone"),
+        Index("ix_contacts_business_optin_updated_id", "business_id", "opt_in_status", "updated_at", "id"),
+    )
     business_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True)
     raw_phone: Mapped[str | None] = mapped_column(String(50), nullable=True)
     normalized_phone: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
@@ -1264,11 +1313,41 @@ class OutboxEvent(BaseModel):
     )
     operation_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     event_type: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    queue_region: Mapped[str] = mapped_column(String(16), nullable=False, default="global", index=True)
+    queue_domain: Mapped[str] = mapped_column(String(40), nullable=False, default="generic", index=True)
+    workload_class: Mapped[str] = mapped_column(String(20), nullable=False, default="cold", index=True)
+    trace_id: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     payload_json: Mapped[dict] = mapped_column(JSONB, nullable=False)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
     attempts: Mapped[int] = mapped_column(nullable=False, default=0)
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=text("now()"))
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+def _derive_outbox_domain_and_workload(event_type: str | None) -> tuple[str, str]:
+    normalized = str(event_type or "").strip().lower()
+    if normalized.startswith("webhook."):
+        return "webhooks", "hot"
+    if normalized in {"whatsapp.send.outbound", "campaign_dispatch_job", "campaign_batch_dispatch_job"}:
+        return "send", "hot"
+    if normalized.startswith("conversation."):
+        return "inbox", "hot"
+    if normalized.startswith("campaign.") or normalized.startswith("bulk_job."):
+        return "campaign", "cold"
+    if normalized.startswith("contact_export."):
+        return "exports", "cold"
+    return "generic", "cold"
+
+
+@event.listens_for(OutboxEvent, "before_insert")
+def _outbox_event_default_classifier(mapper, connection, target: OutboxEvent) -> None:
+    domain, workload = _derive_outbox_domain_and_workload(getattr(target, "event_type", None))
+    if not getattr(target, "queue_domain", None):
+        target.queue_domain = domain
+    if not getattr(target, "workload_class", None):
+        target.workload_class = workload
+    if not getattr(target, "queue_region", None):
+        target.queue_region = "global"
 
 
 class Workspace(BaseModel):
@@ -2005,6 +2084,52 @@ class JobOperation(BaseModel):
     idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     payload_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending")
+
+
+class QuerySnapshot(BaseModel):
+    __tablename__ = "query_snapshots"
+    __table_args__ = (
+        UniqueConstraint("business_id", "resource", "query_hash", name="uq_query_snapshots_business_resource_hash"),
+        Index("ix_query_snapshots_business_resource_status", "business_id", "resource", "status", "created_at", "id"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    resource: Mapped[str] = mapped_column(String(80), nullable=False, index=True)
+    query_hash: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    query_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="active", index=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+
+
+class ContactExportJob(BaseModel):
+    __tablename__ = "contact_export_jobs"
+    __table_args__ = (
+        Index("ix_contact_export_jobs_business_status_created", "business_id", "status", "created_at", "id"),
+    )
+    business_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("businesses.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    query_snapshot_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("query_snapshots.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    selection_mode: Mapped[str] = mapped_column(String(40), nullable=False, default="explicit")
+    selected_contact_ids_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    excluded_contact_ids_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    columns_json: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending", index=True)
+    progress: Mapped[int] = mapped_column(nullable=False, default=0)
+    total_rows: Mapped[int] = mapped_column(nullable=False, default=0)
+    storage_key: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    download_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 class BusinessDashboardStat(BaseModel):

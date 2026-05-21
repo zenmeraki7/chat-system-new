@@ -17,6 +17,7 @@ from app.models.business_domains import (
     OutboxEvent,
 )
 from app.services.campaign_finalize_enqueue_service import enqueue_campaign_finalize
+from app.services.queue_routing_service import worker_region_normalized
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +89,9 @@ class WebhookStatusWorker:
 
     async def _resolve_parallelism(self) -> int:
         now = datetime.now(timezone.utc)
+        region = worker_region_normalized()
         async with AsyncSessionLocal() as db:
+            region_clause = True if region == "global" else OutboxEvent.queue_region.in_(["global", region, region.upper()])
             pending_q = await db.execute(
                 select(OutboxEvent.id)
                 .where(
@@ -96,6 +99,7 @@ class WebhookStatusWorker:
                     OutboxEvent.status == "pending",
                     OutboxEvent.available_at <= now,
                     OutboxEvent.deleted_at.is_(None),
+                    region_clause,
                 )
                 .limit(200)
             )
@@ -110,7 +114,9 @@ class WebhookStatusWorker:
 
     async def _process_one(self) -> bool:
         now = datetime.now(timezone.utc)
+        region = worker_region_normalized()
         async with AsyncSessionLocal() as db:
+            region_clause = True if region == "global" else OutboxEvent.queue_region.in_(["global", region, region.upper()])
             row = await db.execute(
                 select(OutboxEvent)
                 .where(
@@ -118,6 +124,7 @@ class WebhookStatusWorker:
                     OutboxEvent.status == "pending",
                     OutboxEvent.available_at <= now,
                     OutboxEvent.deleted_at.is_(None),
+                    region_clause,
                 )
                 .order_by(OutboxEvent.created_at.asc(), OutboxEvent.id.asc())
                 .with_for_update(skip_locked=True)

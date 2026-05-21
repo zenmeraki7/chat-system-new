@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentActor, require_permissions
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.database import get_db
-from app.models.business_domains import Campaign, CampaignExecutionEvent, CampaignRecipient, CampaignRecipientEvent, CampaignSendJob, CampaignStatusEvent, JobOperation, MessageOutbox, WhatsAppMessageTemplate, WebhookEvent
+from app.models.business_domains import Campaign, CampaignExecutionEvent, CampaignRecipient, CampaignRecipientEvent, CampaignSendJob, CampaignStatusEvent, JobOperation, MessageOutbox, WhatsAppMessageTemplate, WebhookEvent, BusinessDashboardStat, CampaignApprovalSnapshot
 from app.models.business import Business
 from app.models.business_domains import WhatsAppPhoneNumber, WhatsAppBusinessAccount, WhatsAppIntegration
 from app.schemas.campaign import (
@@ -37,9 +37,33 @@ from app.services.campaign_recipient_explainability_service import CampaignRecip
 from app.services.audience_warmth_service import AudienceWarmthService
 from app.services.campaign_health_service import CampaignHealthService
 from app.services.object_storage_service import object_storage_service
+from app.services.table_registry import validate_table_query
+from app.services.query_cost_service import classify_table_query
+from app.services.data_freshness_service import freshness_live_db
 
 
 router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
+LAUNCH_FRESHNESS_MAX_LAG_SECONDS = 900
+
+
+def _compute_campaign_recipient_snapshot_hash(rows: list[CampaignRecipient]) -> str:
+    import hashlib
+    parts: list[str] = []
+    for r in rows:
+        parts.append(
+            "|".join(
+                [
+                    str(r.id),
+                    str(r.status or ""),
+                    str(r.eligibility_status or ""),
+                    str(r.eligibility_reason or ""),
+                    str(r.phone_e164 or ""),
+                ]
+            )
+        )
+    parts.sort()
+    blob = "\n".join(parts)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def _campaign_execution_mode(campaign: Campaign) -> str:
@@ -176,7 +200,7 @@ async def list_campaigns(
         }
         for r in page_rows
     ]
-    return {"items": items, "next_cursor": next_cursor, "total": total}
+    return {"items": items, "next_cursor": next_cursor, "total": total, "freshness": freshness_live_db()}
 
 
 @router.post("/{campaign_id}/recipient-source", response_model=dict)
@@ -461,6 +485,9 @@ async def launch_campaign(
     expected_hash = str(payload.get("expected_confirmation_hash") or "").strip()
     if not expected_hash:
         raise BadRequestException("expected_confirmation_hash is required")
+    launch_snapshot_id = str(payload.get("launch_snapshot_id") or "").strip()
+    if not launch_snapshot_id:
+        raise BadRequestException("launch_snapshot_id is required")
     execution_mode = str(payload.get("execution_mode") or "LIVE").strip().upper()
     if execution_mode not in {"LIVE", "DRY_RUN"}:
         raise BadRequestException("execution_mode must be LIVE or DRY_RUN")
@@ -468,10 +495,6 @@ async def launch_campaign(
     if campaign_execution_mode and campaign_execution_mode not in {"STANDARD", "SLOW_START", "AGGRESSIVE", "SAFE_MODE"}:
         raise BadRequestException("campaign_execution_mode must be STANDARD, SLOW_START, AGGRESSIVE, or SAFE_MODE")
 
-    preview = await CampaignService(db).preview_campaign(
-        business_id=actor.business.id,
-        campaign_id=UUID(campaign_id),
-    )
     campaign_row = (
         await db.execute(
             select(Campaign).where(
@@ -483,8 +506,27 @@ async def launch_campaign(
     ).scalar_one_or_none()
     if not campaign_row:
         raise NotFoundException("Campaign not found")
+    launch_snapshot = (
+        await db.execute(
+            select(CampaignApprovalSnapshot).where(
+                CampaignApprovalSnapshot.id == UUID(launch_snapshot_id),
+                CampaignApprovalSnapshot.business_id == actor.business.id,
+                CampaignApprovalSnapshot.campaign_id == campaign_row.id,
+                CampaignApprovalSnapshot.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if launch_snapshot is None:
+        raise BadRequestException("Launch snapshot not found; regenerate launch confirmation")
+    frozen = dict(launch_snapshot.template_snapshot_json or {})
+    frozen_hash = str(frozen.get("confirmation_hash") or "").strip()
+    if not frozen_hash:
+        raise BadRequestException("Launch snapshot invalid; regenerate launch confirmation")
+    if expected_hash != frozen_hash:
+        raise BadRequestException("Launch confirmation is stale; refresh confirmation and try again")
 
     # Anti-footgun launch checks
+    now = datetime.now(timezone.utc)
     business = (
         await db.execute(select(Business).where(Business.id == actor.business.id, Business.deleted_at.is_(None)))
     ).scalar_one_or_none()
@@ -499,8 +541,20 @@ async def launch_campaign(
     )
     if template_errors:
         raise BadRequestException("Template or variable mapping is invalid; re-preview after fixing errors")
-    if int(preview.get("eligible_recipients") or 0) <= 0:
+    if int(launch_snapshot.recipient_count or 0) <= 0:
         raise BadRequestException("Recipient count is zero; launch blocked")
+    dashboard = (
+        await db.execute(
+            select(BusinessDashboardStat).where(
+                BusinessDashboardStat.business_id == actor.business.id,
+                BusinessDashboardStat.deleted_at.is_(None),
+            ).order_by(BusinessDashboardStat.date_bucket.desc(), BusinessDashboardStat.id.desc()).limit(1)
+        )
+    ).scalar_one_or_none()
+    if dashboard is not None and dashboard.date_bucket is not None:
+        lag = int((now - dashboard.date_bucket).total_seconds())
+        if lag > LAUNCH_FRESHNESS_MAX_LAG_SECONDS:
+            raise BadRequestException("Contacts snapshot stale; refresh audience data before launch")
 
     phone = (
         await db.execute(
@@ -515,6 +569,14 @@ async def launch_campaign(
         raise BadRequestException("Phone number disconnected/unhealthy; launch blocked")
     if (phone.quality_rating or "").lower() in {"red", "low"}:
         raise BadRequestException("Quality rating unsafe; launch blocked")
+    if phone.last_health_check_at is not None:
+        lag = int((now - phone.last_health_check_at).total_seconds())
+        if lag > LAUNCH_FRESHNESS_MAX_LAG_SECONDS:
+            raise BadRequestException("Phone health stale; refresh phone health before launch")
+    if phone.last_template_sync_at is not None:
+        lag = int((now - phone.last_template_sync_at).total_seconds())
+        if lag > LAUNCH_FRESHNESS_MAX_LAG_SECONDS:
+            raise BadRequestException("Template status stale; sync templates before launch")
 
     if campaign_row.waba_id:
         waba = (
@@ -528,6 +590,10 @@ async def launch_campaign(
         ).scalar_one_or_none()
         if not waba:
             raise BadRequestException("WABA disconnected; launch blocked")
+        if waba.last_webhook_received_at is not None:
+            lag = int((now - waba.last_webhook_received_at).total_seconds())
+            if lag > LAUNCH_FRESHNESS_MAX_LAG_SECONDS:
+                raise BadRequestException("Webhook lag too high; inbound processing stale before launch")
     integ = (
         await db.execute(
             select(WhatsAppIntegration).where(
@@ -538,6 +604,10 @@ async def launch_campaign(
     ).scalar_one_or_none()
     if integ and (integ.status or "").lower() not in {"connected"}:
         raise BadRequestException("WABA disconnected; launch blocked")
+    if integ and integ.updated_at is not None:
+        lag = int((now - integ.updated_at).total_seconds())
+        if lag > (LAUNCH_FRESHNESS_MAX_LAG_SECONDS * 2):
+            raise BadRequestException("Wallet or integration status stale; refresh account health before launch")
 
     if campaign_row.csv_import_id:
         bad_import_rows = (
@@ -554,22 +624,22 @@ async def launch_campaign(
         if bad_import_rows is not None:
             raise BadRequestException("Imported contacts with missing opt-in source/consent found; launch blocked")
 
-    import hashlib
-    confirmation_material = "|".join(
-        [
-            str(campaign_row.id),
-            str(campaign_row.template_name or ""),
-            str(campaign_row.phone_number_id or ""),
-            str(preview.get("eligible_recipients") or 0),
-            str(preview.get("skipped_recipients") or 0),
-            str((preview.get("estimated_cost") or {}).get("amount") or 0),
-            str((preview.get("estimated_cost") or {}).get("currency") or ""),
-            str(preview.get("estimated_duration_minutes") or 0),
-        ]
-    )
-    actual_hash = hashlib.sha256(confirmation_material.encode("utf-8")).hexdigest()
-    if expected_hash != actual_hash:
-        raise BadRequestException("Launch confirmation is stale; refresh confirmation and try again")
+    current_rows = (
+        await db.execute(
+            select(CampaignRecipient).where(
+                CampaignRecipient.campaign_id == campaign_row.id,
+                CampaignRecipient.business_id == actor.business.id,
+                CampaignRecipient.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    current_hash = _compute_campaign_recipient_snapshot_hash(current_rows)
+    if current_hash != str(frozen.get("recipient_snapshot_hash") or ""):
+        raise BadRequestException("Recipient set changed after snapshot; regenerate launch snapshot")
+    if str(frozen.get("template_id") or "") != str(campaign_row.template_id or ""):
+        raise BadRequestException("Template changed after snapshot; regenerate launch snapshot")
+    if str(frozen.get("phone_number_id") or "") != str(campaign_row.phone_number_id or ""):
+        raise BadRequestException("Phone number changed after snapshot; regenerate launch snapshot")
     if not campaign_execution_mode:
         campaign_execution_mode = "STANDARD"
         if (campaign_row.template_category or "").lower() == "marketing":
@@ -610,10 +680,11 @@ async def launch_campaign(
         payload_json={
             "execution_mode": execution_mode,
             "campaign_execution_mode": campaign_execution_mode,
-            "eligible_recipients": int(preview.get("eligible_recipients") or 0),
-            "skipped_recipients": int(preview.get("skipped_recipients") or 0),
-            "estimated_cost": preview.get("estimated_cost") or {"amount": 0, "currency": "USD"},
-            "estimated_duration_minutes": int(preview.get("estimated_duration_minutes") or 0),
+            "eligible_recipients": int(launch_snapshot.recipient_count or 0),
+            "skipped_recipients": int((frozen.get("preview") or {}).get("skipped_recipients") or 0),
+            "estimated_cost": (frozen.get("preview") or {}).get("estimated_cost") or {"amount": 0, "currency": "USD"},
+            "estimated_duration_minutes": int((frozen.get("preview") or {}).get("estimated_duration_minutes") or 0),
+            "launch_snapshot_id": str(launch_snapshot.id),
         },
     )
     await db.commit()
@@ -642,6 +713,44 @@ async def get_launch_confirmation(
         business_id=actor.business.id,
         campaign_id=UUID(campaign_id),
     )
+    recipients = (
+        await db.execute(
+            select(CampaignRecipient).where(
+                CampaignRecipient.campaign_id == campaign.id,
+                CampaignRecipient.business_id == actor.business.id,
+                CampaignRecipient.deleted_at.is_(None),
+            )
+        )
+    ).scalars().all()
+    recipient_snapshot_hash = _compute_campaign_recipient_snapshot_hash(recipients)
+    phone = (
+        await db.execute(
+            select(WhatsAppPhoneNumber).where(
+                WhatsAppPhoneNumber.business_id == actor.business.id,
+                WhatsAppPhoneNumber.phone_number_id == campaign.phone_number_id,
+                WhatsAppPhoneNumber.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    waba = None
+    if campaign.waba_id:
+        waba = (
+            await db.execute(
+                select(WhatsAppBusinessAccount).where(
+                    WhatsAppBusinessAccount.business_id == actor.business.id,
+                    WhatsAppBusinessAccount.waba_id == campaign.waba_id,
+                    WhatsAppBusinessAccount.deleted_at.is_(None),
+                )
+            )
+        ).scalar_one_or_none()
+    integ = (
+        await db.execute(
+            select(WhatsAppIntegration).where(
+                WhatsAppIntegration.business_id == actor.business.id,
+                WhatsAppIntegration.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
     import hashlib
     confirmation_material = "|".join(
         [
@@ -656,6 +765,56 @@ async def get_launch_confirmation(
         ]
     )
     confirmation_hash = hashlib.sha256(confirmation_material.encode("utf-8")).hexdigest()
+    frozen_payload = {
+        "campaign_id": str(campaign.id),
+        "template_id": str(campaign.template_id) if campaign.template_id else None,
+        "template_name": campaign.template_name,
+        "phone_number_id": campaign.phone_number_id,
+        "waba_id": campaign.waba_id,
+        "preview": preview,
+        "recipient_snapshot_hash": recipient_snapshot_hash,
+        "phone_health": {
+            "status": (phone.status if phone else None),
+            "quality_rating": (phone.quality_rating if phone else None),
+            "last_health_check_at": (phone.last_health_check_at.isoformat() if phone and phone.last_health_check_at else None),
+        },
+        "webhook_health": {
+            "last_webhook_received_at": (waba.last_webhook_received_at.isoformat() if waba and waba.last_webhook_received_at else None),
+        },
+        "token_integration_status": {
+            "integration_status": (integ.status if integ else None),
+            "integration_updated_at": (integ.updated_at.isoformat() if integ and integ.updated_at else None),
+        },
+        "confirmation_hash": confirmation_hash,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    snapshot = (
+        await db.execute(
+            select(CampaignApprovalSnapshot).where(
+                CampaignApprovalSnapshot.business_id == actor.business.id,
+                CampaignApprovalSnapshot.campaign_id == campaign.id,
+                CampaignApprovalSnapshot.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if snapshot is None:
+        snapshot = CampaignApprovalSnapshot(
+            business_id=actor.business.id,
+            campaign_id=campaign.id,
+            approved_by_user_id=actor.user.id,
+            template_snapshot_json=frozen_payload,
+            recipient_count=int(preview.get("eligible_recipients") or 0),
+            estimated_cost=float((preview.get("estimated_cost") or {}).get("amount") or 0.0),
+            compliance_acknowledged=False,
+        )
+        db.add(snapshot)
+    else:
+        snapshot.template_snapshot_json = frozen_payload
+        snapshot.recipient_count = int(preview.get("eligible_recipients") or 0)
+        snapshot.estimated_cost = float((preview.get("estimated_cost") or {}).get("amount") or 0.0)
+        snapshot.approved_by_user_id = actor.user.id
+    await db.commit()
+    await db.refresh(snapshot)
     return {
         "campaign_id": str(campaign.id),
         "strict_confirmation_required": True,
@@ -671,6 +830,7 @@ async def get_launch_confirmation(
         "estimated_duration_minutes": int(preview.get("estimated_duration_minutes") or 0),
         "exclusions_notice": "This campaign will exclude opted-out, blocked, invalid, and duplicate contacts.",
         "confirmation_hash": confirmation_hash,
+        "launch_snapshot_id": str(snapshot.id),
         "confirmation_required_text": "CONFIRM",
     }
 
@@ -947,6 +1107,13 @@ async def list_campaign_recipients(
     actor: CurrentActor = Depends(require_permissions("campaigns:read")),
     db: AsyncSession = Depends(get_db),
 ):
+    sort_by, sort_dir, limit = validate_table_query(
+        table="campaign_recipients",
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+        limit=limit,
+        filters={"status": status, "search": search},
+    )
     stmt = select(CampaignRecipient).where(
         CampaignRecipient.business_id == actor.business.id,
         CampaignRecipient.campaign_id == UUID(campaign_id),
@@ -958,12 +1125,17 @@ async def list_campaign_recipients(
         q = f"%{search.strip()}%"
         stmt = stmt.where(or_(CampaignRecipient.name.ilike(q), CampaignRecipient.phone_e164.ilike(q), CampaignRecipient.status.ilike(q)))
     sort_map = {
-        "created_at": CampaignRecipient.created_at,
         "updated_at": CampaignRecipient.updated_at,
         "sent_at": CampaignRecipient.sent_at,
         "status": CampaignRecipient.status,
     }
-    sort_key = sort_map.get(sort_by, CampaignRecipient.created_at)
+    sort_key = sort_map.get(sort_by, CampaignRecipient.updated_at)
+    query_risk = classify_table_query(
+        table="campaign_recipients",
+        sort_by=sort_by,
+        limit=limit,
+        filters={"status": status, "search": search},
+    )
     sort_desc = str(sort_dir).lower() != "asc"
     if cursor:
         cursor_row = (
@@ -996,12 +1168,12 @@ async def list_campaign_recipients(
             "status": r.status,
             "eligibility_status": r.eligibility_status,
             "eligibility_reason": r.eligibility_reason,
-            "phone_e164": r.phone_e164,
+            "phone_e164": (r.phone_e164 if ("*" in actor.permissions or "campaigns:columns:phone" in actor.permissions) else None),
             "provider_message_id": r.provider_message_id,
             "attempt_count": r.attempt_count,
-            "actual_cost": r.actual_cost,
-            "last_error_code": r.last_error_code,
-            "last_error_message": r.last_error_message,
+            "actual_cost": (r.actual_cost if ("*" in actor.permissions or "campaigns:columns:cost" in actor.permissions) else None),
+            "last_error_code": (r.last_error_code if ("*" in actor.permissions or "campaigns:columns:errors" in actor.permissions) else None),
+            "last_error_message": (r.last_error_message if ("*" in actor.permissions or "campaigns:columns:errors" in actor.permissions) else None),
             "sent_at": r.sent_at.isoformat() if r.sent_at else None,
             "delivered_at": r.delivered_at.isoformat() if r.delivered_at else None,
             "read_at": r.read_at.isoformat() if r.read_at else None,
@@ -1009,7 +1181,14 @@ async def list_campaign_recipients(
         }
         for r in page_rows
     ]
-    return {"items": items, "next_cursor": next_cursor, "total": total}
+    return {
+        "items": items,
+        "next_cursor": next_cursor,
+        "total": total,
+        "query_risk_class": query_risk.risk_class,
+        "query_risk_reasons": query_risk.reasons,
+        "freshness": freshness_live_db(),
+    }
 
 
 @router.get("/{campaign_id}/recipient-explainability", response_model=list[dict])

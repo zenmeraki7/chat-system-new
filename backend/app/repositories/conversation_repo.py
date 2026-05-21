@@ -16,9 +16,9 @@ class ConversationRepository(TenantMutableRepository[Conversation]):
         super().__init__(Conversation, db)
 
     async def get_by_business(
-        self, business_id: UUID, skip: int = 0, limit: int = 50
+        self, business_id: UUID, limit: int = 50
     ) -> List[Conversation]:
-        # Backward-compatible wrapper; callers should move to list_for_business cursor pagination.
+        # Backward-compatible wrapper (cursor-first internally).
         return await self.list_for_business(business_id=business_id, limit=limit)
 
     async def list_for_business(

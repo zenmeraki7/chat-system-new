@@ -116,34 +116,40 @@ class RateLimiterService:
         contact_id: str | None,
         is_retry: bool,
         template_category: str | None,
+        throughput_multiplier: float = 1.0,
     ) -> RateLimitDecision:
+        multiplier = max(0.1, min(1.0, float(throughput_multiplier or 1.0)))
         specs: list[LimitSpec] = [
-            LimitSpec(key="rate:global", capacity=max(1, settings.RATE_LIMIT_GLOBAL_MPS), refill_per_sec=max(1, settings.RATE_LIMIT_GLOBAL_MPS)),
+            LimitSpec(
+                key="rate:global",
+                capacity=max(1, int(settings.RATE_LIMIT_GLOBAL_MPS * multiplier)),
+                refill_per_sec=max(1, int(settings.RATE_LIMIT_GLOBAL_MPS * multiplier)),
+            ),
             LimitSpec(
                 key=f"rate:business:{business_id}",
-                capacity=max(1, settings.RATE_LIMIT_BUSINESS_MPS),
-                refill_per_sec=max(1, settings.RATE_LIMIT_BUSINESS_MPS),
+                capacity=max(1, int(settings.RATE_LIMIT_BUSINESS_MPS * multiplier)),
+                refill_per_sec=max(1, int(settings.RATE_LIMIT_BUSINESS_MPS * multiplier)),
             ),
             LimitSpec(
                 key=f"rate:phone:{phone_number_id}",
-                capacity=max(1, settings.RATE_LIMIT_PHONE_MPS),
-                refill_per_sec=max(1, settings.RATE_LIMIT_PHONE_MPS),
+                capacity=max(1, int(settings.RATE_LIMIT_PHONE_MPS * multiplier)),
+                refill_per_sec=max(1, int(settings.RATE_LIMIT_PHONE_MPS * multiplier)),
             ),
         ]
         if waba_id:
             specs.append(
                 LimitSpec(
                     key=f"rate:waba:{waba_id}",
-                    capacity=max(1, settings.RATE_LIMIT_WABA_MPS),
-                    refill_per_sec=max(1, settings.RATE_LIMIT_WABA_MPS),
+                    capacity=max(1, int(settings.RATE_LIMIT_WABA_MPS * multiplier)),
+                    refill_per_sec=max(1, int(settings.RATE_LIMIT_WABA_MPS * multiplier)),
                 )
             )
         if campaign_id:
             specs.append(
                 LimitSpec(
                     key=f"rate:campaign:{campaign_id}",
-                    capacity=max(1, settings.RATE_LIMIT_CAMPAIGN_MPS),
-                    refill_per_sec=max(1, settings.RATE_LIMIT_CAMPAIGN_MPS),
+                    capacity=max(1, int(settings.RATE_LIMIT_CAMPAIGN_MPS * multiplier)),
+                    refill_per_sec=max(1, int(settings.RATE_LIMIT_CAMPAIGN_MPS * multiplier)),
                 )
             )
         if is_retry and contact_id:
@@ -194,4 +200,3 @@ class RateLimiterService:
 
 
 rate_limiter_service = RateLimiterService()
-

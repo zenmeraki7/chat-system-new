@@ -2,6 +2,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.exceptions import ForbiddenException, NotFoundException
+from app.services.whatsapp_phone_readiness import whatsapp_phone_readiness_policy
 from app.services.token_crypto_service import token_crypto_service
 from app.models.business_domains import (
     WhatsAppPhoneNumber,
@@ -31,6 +32,17 @@ class CredentialResolver:
             raise ForbiddenException("Phone number is disabled for sending")
         if phone.disabled_at is not None or phone.status.lower() != "active":
             raise ForbiddenException("Phone number is not active for sending")
+        readiness = whatsapp_phone_readiness_policy.evaluate(
+            {
+                "code_verification_status": phone.verification_status,
+                "status": phone.status,
+            }
+        )
+        if not readiness.ready:
+            raise ForbiddenException(f"Phone number is still provisioning: {readiness.reason}")
+        health_status = str(phone.last_health_status or "").strip().lower()
+        if health_status in {"pending", "error", "degraded"}:
+            raise ForbiddenException(f"Phone number provisioning health is not ready for send: {health_status}")
 
         ownership_res = await self.db.execute(
             select(BusinessProviderAssetLink.id)

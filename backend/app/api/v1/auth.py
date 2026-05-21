@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import get_db
-from app.schemas.auth import RegisterRequest, LoginRequest, TokenResponse
+from app.schemas.auth import RegisterRequest, LoginRequest, TokenResponse, MeProfileResponse
 from app.schemas.business import BusinessProfileResponse, BusinessCreatedResponse
 from app.services.auth_service import AuthService
 from app.api.deps import CurrentActor, require_permissions
@@ -41,12 +41,15 @@ async def login(payload: LoginRequest, db: AsyncSession = Depends(get_db)):
     )
 
 
-@router.get("/me", response_model=BusinessProfileResponse)
+@router.get("/me", response_model=MeProfileResponse)
 async def get_me(
     actor: CurrentActor = Depends(require_permissions("business:read")),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get current authenticated business profile."""
-    from app.services.business_service import BusinessService
-    profile = await BusinessService(db).get_business_profile(actor.business.id)
-    return BusinessProfileResponse(**profile)
+    return MeProfileResponse(
+        user_id=actor.user.id,
+        business_id=actor.business.id,
+        business_name=actor.business.name,
+        role=str(actor.membership.role_code or ""),
+        permissions=sorted(actor.permissions),
+    )

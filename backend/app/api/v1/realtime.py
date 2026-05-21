@@ -14,6 +14,7 @@ from app.models.business import Business
 from app.models.business_domains import (
     Campaign,
     CampaignRecipient,
+    Contact,
     ConversationStatusEvent,
     MessageStatusEvent,
     WebhookEvent,
@@ -170,3 +171,77 @@ async def stream_realtime_events(
             await asyncio.sleep(interval_ms / 1000.0)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.get("/table-patches")
+async def stream_table_patches(
+    table: str = Query(default="inbox"),
+    interval_ms: int = Query(default=2500, ge=1000, le=15000),
+    actor: CurrentActor = Depends(require_permissions("campaigns:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    business_id = actor.business.id
+    normalized = str(table or "").strip().lower()
+    if normalized not in {"inbox", "campaigns", "contacts"}:
+        normalized = "inbox"
+
+    async def generator():
+        yield _sse("connected", {"table": normalized, "business_id": str(business_id), "ts": datetime.now(timezone.utc).isoformat()})
+        last_ts = None
+        while True:
+            if normalized == "contacts":
+                stmt = select(Contact).where(Contact.business_id == business_id, Contact.deleted_at.is_(None))
+                if last_ts is not None:
+                    stmt = stmt.where(Contact.updated_at > last_ts)
+                rows = (await db.execute(stmt.order_by(Contact.updated_at.asc()).limit(200))).scalars().all()
+                for row in rows:
+                    payload = {
+                        "row_id": str(row.id),
+                        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                        "opt_in_status": row.opt_in_status,
+                        "blocked": bool(row.blocked_at),
+                        "unsubscribed": bool(row.unsubscribed_at),
+                    }
+                    yield _sse("row_patch", payload)
+                    if row.updated_at and (last_ts is None or row.updated_at > last_ts):
+                        last_ts = row.updated_at
+            elif normalized == "campaigns":
+                stmt = select(Campaign).where(Campaign.business_id == business_id, Campaign.deleted_at.is_(None))
+                if last_ts is not None:
+                    stmt = stmt.where(Campaign.updated_at > last_ts)
+                rows = (await db.execute(stmt.order_by(Campaign.updated_at.asc()).limit(200))).scalars().all()
+                for row in rows:
+                    payload = {
+                        "row_id": str(row.id),
+                        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                        "status": row.status,
+                        "delivered_count": int(row.delivered_count or 0),
+                        "failed_count": int(row.failed_count or 0),
+                        "read_count": int(row.read_count or 0),
+                        "replied_count": int(row.replied_count or 0),
+                    }
+                    yield _sse("row_patch", payload)
+                    if row.updated_at and (last_ts is None or row.updated_at > last_ts):
+                        last_ts = row.updated_at
+            else:
+                stmt = select(ConversationStatusEvent).where(
+                    ConversationStatusEvent.business_id == business_id,
+                    ConversationStatusEvent.deleted_at.is_(None),
+                )
+                if last_ts is not None:
+                    stmt = stmt.where(ConversationStatusEvent.created_at > last_ts)
+                rows = (await db.execute(stmt.order_by(ConversationStatusEvent.created_at.asc()).limit(200))).scalars().all()
+                for row in rows:
+                    payload = {
+                        "row_id": str(row.conversation_id),
+                        "updated_at": row.created_at.isoformat() if row.created_at else None,
+                        "status": row.new_status,
+                        "reason": row.reason,
+                    }
+                    yield _sse("row_patch", payload)
+                    if row.created_at and (last_ts is None or row.created_at > last_ts):
+                        last_ts = row.created_at
+            yield _sse("heartbeat", {"table": normalized, "ts": datetime.now(timezone.utc).isoformat()})
+            await asyncio.sleep(interval_ms / 1000.0)
+
+    return StreamingResponse(generator(), media_type="text/event-stream")

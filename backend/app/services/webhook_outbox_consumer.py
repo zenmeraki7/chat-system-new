@@ -6,6 +6,7 @@ from uuid import UUID
 from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
+from app.models.business import Business
 from app.models.business_domains import (
     OutboxEvent,
     WebhookEvent,
@@ -17,6 +18,7 @@ from app.models.business_domains import (
 )
 from app.services.chat_service import ChatService
 from app.services.audit_log_service import AuditLogService
+from app.services.queue_routing_service import classify_outbox_event, worker_region_normalized
 from app.services.webhook_tenant_resolver import WebhookTenantResolver
 from app.repositories.contact_repo import ContactRepository
 from app.models.business_domains import Contact, SuppressionListEntry
@@ -56,7 +58,9 @@ class WebhookOutboxConsumer:
                 await asyncio.sleep(self.poll_interval_seconds)
 
     async def _process_one(self) -> bool:
+        region = worker_region_normalized()
         async with AsyncSessionLocal() as db:
+            region_clause = True if region == "global" else OutboxEvent.queue_region.in_(["global", region, region.upper()])
             row = await db.execute(
                 select(OutboxEvent)
                 .where(
@@ -64,6 +68,7 @@ class WebhookOutboxConsumer:
                     OutboxEvent.status == "pending",
                     OutboxEvent.available_at <= datetime.now(timezone.utc),
                     OutboxEvent.deleted_at.is_(None),
+                    region_clause,
                 )
                 .order_by(OutboxEvent.created_at.asc(), OutboxEvent.id.asc())
                 .with_for_update(skip_locked=True)
@@ -144,6 +149,12 @@ class WebhookOutboxConsumer:
         business_id = webhook_event.business_id
         if business_id is None:
             raise ValueError("Webhook event cannot be processed without resolved business_id")
+        region = (
+            await db.execute(select(Business.data_region).where(Business.id == business_id).limit(1))
+        ).scalar_one_or_none()
+        queue_region = str(region or "global")
+        status_queue_domain, status_workload_class = classify_outbox_event("webhook.status.whatsapp")
+        suppression_queue_domain, suppression_workload_class = classify_outbox_event("contact.suppression.history")
 
         for entry in payload.get("entry", []):
             entry_waba_id = entry.get("id")
@@ -184,6 +195,9 @@ class WebhookOutboxConsumer:
                             business_id=business_id,
                             operation_id=provider_event_id,
                             event_type="webhook.status.whatsapp",
+                            queue_region=queue_region,
+                            queue_domain=status_queue_domain,
+                            workload_class=status_workload_class,
                             payload_json={
                                 "webhook_event_id": str(webhook_event.id),
                                 "provider_event_id": provider_event_id,
@@ -259,7 +273,13 @@ class WebhookOutboxConsumer:
                 try:
                     business, _ = await WebhookTenantResolver(db).resolve(waba_id=waba_id, phone_number_id=phone_number_id)
                     return business.id
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "webhook_outbox_tenant_resolution_failed waba_id=%s phone_number_id=%s error=%s",
+                        str(waba_id),
+                        str(phone_number_id),
+                        str(exc),
+                    )
                     continue
         return None
 
@@ -270,6 +290,12 @@ class WebhookOutboxConsumer:
             .order_by(ProviderWebhookEvent.created_at.desc())
             .with_for_update()
         )
+        evt = row.scalars().first()
+        if evt is None:
+            return
+        evt.processing_status = status
+        evt.processed_at = datetime.now(timezone.utc)
+        evt.failure_reason = failure_reason
 
     async def _apply_stop_unsubscribe_if_needed(self, *, db, business_id: UUID, from_wa_id: str, text_body: str) -> None:
         token = (text_body or "").strip().lower()
@@ -302,10 +328,18 @@ class WebhookOutboxConsumer:
                     source="stop_keyword",
                 )
             )
+        region = (
+            await db.execute(select(Business.data_region).where(Business.id == business_id).limit(1))
+        ).scalar_one_or_none()
+        queue_region = str(region or "global")
+        suppression_queue_domain, suppression_workload_class = classify_outbox_event("contact.suppression.history")
         db.add(
             OutboxEvent(
                 business_id=business_id,
                 event_type="contact.suppression.history",
+                queue_region=queue_region,
+                queue_domain=suppression_queue_domain,
+                workload_class=suppression_workload_class,
                 payload_json={
                     "contact_id": str(contact.id),
                     "wa_id": from_wa_id,
@@ -316,12 +350,6 @@ class WebhookOutboxConsumer:
                 status="pending",
             )
         )
-        evt = row.scalars().first()
-        if evt is None:
-            return
-        evt.processing_status = status
-        evt.processed_at = datetime.now(timezone.utc)
-        evt.failure_reason = failure_reason
 
     async def _audit_platform_event(self, db, business_id: UUID, webhook_event_id: UUID, kind: str, payload: dict) -> None:
         await AuditLogService(db).write(

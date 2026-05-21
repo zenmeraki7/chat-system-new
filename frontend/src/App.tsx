@@ -1,8 +1,9 @@
-import { Link, Navigate, Outlet, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
+﻿import { Link, Navigate, Outlet, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { FormEvent, useEffect, useMemo, useState } from "react";
 import { API_ORIGIN, api } from "./api";
 import { DataTable, type DataTableColumn } from "./components/DataTable";
-import { normalizeQueryPage, toQueryString, type QueryState } from "./lib/queryContract";
+import { RemoteDataTable } from "./components/RemoteDataTable";
+import { normalizeQueryPage, toQueryString, type QueryState, type SelectionState } from "./lib/queryContract";
 
 type Campaign = {
   campaign_id: string;
@@ -24,6 +25,38 @@ type Campaign = {
   actual_cost?: number | null;
 };
 
+type WhatsAppTemplate = {
+  id: string;
+  waba_id: string;
+  meta_template_id?: string | null;
+  name: string;
+  language: string;
+  category?: string | null;
+  status: string;
+  components_json: Record<string, unknown>;
+  rejection_reason?: string | null;
+  last_synced_at?: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+type TemplateSummary = {
+  total: number;
+  approved_or_active: number;
+  pending_or_in_review: number;
+  rejected_or_paused: number;
+  draft_or_unknown: number;
+};
+
+type TemplateSyncRun = {
+  run_id: string;
+  provider: string;
+  sync_type: string;
+  status: string;
+  started_at?: string | null;
+  completed_at?: string | null;
+  failure_reason?: string | null;
+};
 type ContactCRMRecord = {
   id: string;
   phone_e164?: string | null;
@@ -66,6 +99,7 @@ type CampaignAnalytics = {
 
 type AgentMessage = {
   public_id: string;
+  id?: string;
   direction: string;
   sender_type: string;
   message_type: string;
@@ -99,6 +133,37 @@ type WhatsAppSetupDiagnostics = {
   webhook_last_received_at?: string | null;
   webhook_heartbeat_status: string;
   webhook_heartbeat_lag_seconds?: number | null;
+};
+type CampaignPreviewResponse = {
+  sample_messages?: unknown[];
+  preview_messages?: unknown[];
+  selected_recipients?: number;
+  total_recipients?: number;
+  eligible_recipients?: number;
+  skipped_recipients?: number;
+  estimated_cost?: { currency?: string; amount?: number };
+  estimated_duration_minutes?: number;
+};
+type LaunchConfirmationResponse = {
+  confirmation_hash?: string;
+  template_name?: string;
+  template_id?: string;
+  phone_number_id?: string;
+  recipients?: number;
+  estimated_cost?: { currency?: string; amount?: number };
+};
+type CampaignEvent = {
+  created_at?: string;
+  event_type?: string;
+  new_status?: string;
+  kind?: string;
+  reason?: string;
+};
+type CampaignBlackboxEvent = {
+  observed_at?: string;
+  created_at?: string;
+  event_type?: string;
+  message?: string;
 };
 type AuthLoginResponse = {
   access_token: string;
@@ -179,27 +244,50 @@ function LoginPage() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
+  const finishLogin = async (loginEmail: string, loginPassword: string) => {
+    const result = await api<AuthLoginResponse>("/auth/login", "POST", { email: loginEmail.trim(), password: loginPassword });
+    localStorage.setItem("access_token", result.access_token);
+    const subject = decodeJwtSubject(result.access_token);
+    if (subject) {
+      const parts = subject.split(":");
+      if (parts.length === 2) localStorage.setItem("current_user_id", parts[1]);
+    }
+    try {
+      const me = await api<MeProfile>("/auth/me");
+      if (me?.business_name) localStorage.setItem("auth_business_name", me.business_name);
+      if (me?.id) localStorage.setItem("auth_business_id", me.id);
+    } catch {
+      // Ignore secondary profile bootstrap failure; token is already persisted.
+    }
+    const target = (location.state as { from?: string } | null)?.from || "/dashboard";
+    nav(target, { replace: true });
+  };
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return;
+    if (sessionStorage.getItem("dev_auto_login_attempted") === "1") return;
+    sessionStorage.setItem("dev_auto_login_attempted", "1");
+    const devEmail = (import.meta.env.VITE_DEV_AUTO_LOGIN_EMAIL as string | undefined) || "owner@test.com";
+    const devPassword = (import.meta.env.VITE_DEV_AUTO_LOGIN_PASSWORD as string | undefined) || "StrongPass123!";
+    setEmail(devEmail);
+    setPassword(devPassword);
+    setBusy(true);
+    setErr("");
+    finishLogin(devEmail, devPassword)
+      .catch((e) => {
+        setErr((e as Error).message);
+        clearAuthStorage();
+      })
+      .finally(() => setBusy(false));
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setErr("");
     try {
-      const result = await api<AuthLoginResponse>("/auth/login", "POST", { email: email.trim(), password });
-      localStorage.setItem("access_token", result.access_token);
-      const subject = decodeJwtSubject(result.access_token);
-      if (subject) {
-        const parts = subject.split(":");
-        if (parts.length === 2) localStorage.setItem("current_user_id", parts[1]);
-      }
-      try {
-        const me = await api<MeProfile>("/auth/me");
-        if (me?.business_name) localStorage.setItem("auth_business_name", me.business_name);
-        if (me?.id) localStorage.setItem("auth_business_id", me.id);
-      } catch {
-        // Ignore secondary profile bootstrap failure; token is already persisted.
-      }
-      const target = (location.state as { from?: string } | null)?.from || "/dashboard";
-      nav(target, { replace: true });
+      await finishLogin(email, password);
     } catch (e) {
       setErr((e as Error).message);
       clearAuthStorage();
@@ -229,6 +317,65 @@ function Layout({ children }: { children: React.ReactNode }) {
   );
 }
 
+function RevenuePage() {
+  const [overview, setOverview] = useState<any>(null);
+  const [campaigns, setCampaigns] = useState<Campaign[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      api<any>("/analytics/overview"),
+      api<unknown>("/campaigns?limit=200"),
+    ])
+      .then(([o, c]) => {
+        if (!active) return;
+        setOverview(o || null);
+        setCampaigns(normalizeQueryPage<Campaign>(c).items);
+      })
+      .catch((e) => {
+        if (!active) return;
+        setErr((e as Error).message || "Unable to load revenue data");
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const campaignCost = campaigns.reduce((sum, c) => sum + Number(c.actual_cost || 0), 0);
+  const sent = campaigns.reduce((sum, c) => sum + Number(c.sent_count || 0), 0);
+  const delivered = campaigns.reduce((sum, c) => sum + Number(c.delivered_count || 0), 0);
+  const failed = campaigns.reduce((sum, c) => sum + Number(c.failed_count || 0), 0);
+  const read = campaigns.reduce((sum, c) => sum + Number(c.read_count || 0), 0);
+  const replied = campaigns.reduce((sum, c) => sum + Number(c.replied_count || 0), 0);
+  const convRate = delivered > 0 ? (read / delivered) * 100 : 0;
+  const replyRate = delivered > 0 ? (replied / delivered) * 100 : 0;
+
+  return (
+    <Layout>
+      <h2>Revenue & Performance</h2>
+      {loading ? <p>Loading revenue data...</p> : null}
+      {err ? <p>{err}</p> : null}
+      <section className="kpi-grid">
+        <article className="kpi-card"><h4>Total campaign spend</h4><p>USD {campaignCost.toFixed(2)}</p></article>
+        <article className="kpi-card"><h4>Messages sent</h4><p>{sent}</p></article>
+        <article className="kpi-card"><h4>Delivered</h4><p>{delivered}</p></article>
+        <article className="kpi-card"><h4>Failed</h4><p>{failed}</p></article>
+        <article className="kpi-card"><h4>Read rate</h4><p>{convRate.toFixed(1)}%</p></article>
+        <article className="kpi-card"><h4>Reply rate</h4><p>{replyRate.toFixed(1)}%</p></article>
+      </section>
+      <section className="panel">
+        <h3>Live overview</h3>
+        <pre style={{ whiteSpace: "pre-wrap", margin: 0 }}>{JSON.stringify(overview || {}, null, 2)}</pre>
+      </section>
+    </Layout>
+  );
+}
+
 function PlaceholderPage({ title, subtitle }: { title: string; subtitle: string }) {
   return (
     <Layout>
@@ -249,7 +396,9 @@ function DashboardPage() {
     api<unknown>("/campaigns?limit=100")
       .then((payload) => setCampaigns(normalizeQueryPage<Campaign>(payload).items))
       .catch(console.error);
-    api<ConversationInboxItem[]>("/conversations?limit=100").then(setConversations).catch(console.error);
+    api<unknown>("/conversations?limit=100")
+      .then((payload) => setConversations(normalizeQueryPage<ConversationInboxItem>(payload).items))
+      .catch(console.error);
   }, []);
 
   const primaryCampaignId = useMemo(() => {
@@ -299,9 +448,15 @@ function DashboardPage() {
 
   return (
     <Layout>
-      <h2>Dashboard</h2>
-      <p className="dashboard-subtitle">Campaign control room with live send risk, inbox pressure, and delivery health.</p>
-      <div className="dashboard-kpis">
+      <section className="analytics-hero">
+        <div>
+          <span>Live Command Analytics</span>
+          <h2>Business performance control room</h2>
+          <p>Campaign delivery, inbox pressure, phone health, webhook status, and revenue signals in one operational view.</p>
+        </div>
+        <button onClick={() => window.location.reload()}>Refresh data</button>
+      </section>
+      <div className="dashboard-kpis analytics-kpis">
         <article className="kpi-card"><h4>WhatsApp Number Health</h4><p>{phoneHealth}</p></article>
         <article className="kpi-card"><h4>Unread Conversations</h4><p>{unreadConversations}</p></article>
         <article className="kpi-card"><h4>Open Conversations</h4><p>{openConversations}</p></article>
@@ -313,7 +468,7 @@ function DashboardPage() {
         <article className="kpi-card"><h4>Webhook / Connection Status</h4><p>{webhookStatus}</p></article>
       </div>
 
-      <div className="dashboard-widgets">
+      <div className="dashboard-widgets analytics-widgets">
         <section className="widget-card"><h3>Phone Number Health</h3><p>{phoneHealth}</p></section>
         <section className="widget-card"><h3>Campaign Performance</h3><p>{campaignPerformance}</p></section>
         <section className="widget-card"><h3>Inbox SLA</h3><p>{inboxSla}</p></section>
@@ -341,6 +496,84 @@ function DashboardPage() {
   );
 }
 
+function TemplateApprovalPage() {
+  const nav = useNavigate();
+  const [templates, setTemplates] = useState<WhatsAppTemplate[]>([]);
+  const [summary, setSummary] = useState<TemplateSummary | null>(null);
+  const [runs, setRuns] = useState<TemplateSyncRun[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [filter, setFilter] = useState("all");
+  const [search, setSearch] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  const load = async () => {
+    const [templateRows, summaryRow, runRows] = await Promise.all([
+      api<WhatsAppTemplate[]>(`/templates?${toQueryString({ search: search || undefined, limit: 200 })}`),
+      api<TemplateSummary>("/templates/summary"),
+      api<TemplateSyncRun[]>("/templates/sync/runs?limit=8"),
+    ]);
+    setTemplates(templateRows);
+    setSummary(summaryRow);
+    setRuns(runRows);
+    if (templateRows.length && !selectedId) setSelectedId(templateRows[0].id);
+  };
+
+  useEffect(() => { load().catch((e) => setMsg((e as Error).message)); }, []);
+
+  const syncTemplates = async () => {
+    setSyncing(true);
+    setMsg("Syncing templates from Meta...");
+    try {
+      const res = await api<{ status: string; templates_fetched: number; templates_upserted: number; failure_reason?: string | null }>("/templates/sync", "POST", {});
+      setMsg(res.failure_reason || `Sync ${res.status}: fetched ${res.templates_fetched}, updated ${res.templates_upserted}.`);
+      await load();
+    } catch (e) {
+      setMsg((e as Error).message);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const updateStatus = async (templateId: string, status: string) => {
+    setMsg(`Updating template to ${status}...`);
+    try {
+      await api(`/templates/${templateId}/status`, "PATCH", { status });
+      setMsg(`Template marked ${status}.`);
+      await load();
+    } catch (e) {
+      setMsg((e as Error).message);
+    }
+  };
+
+  const filtered = templates.filter((t) => {
+    const normalized = String(t.status || "").toLowerCase();
+    if (filter === "approved") return ["approved", "active"].includes(normalized);
+    if (filter === "pending") return ["pending", "in_review", "submitted"].includes(normalized);
+    if (filter === "rejected") return ["rejected", "paused", "disabled"].includes(normalized);
+    if (filter === "draft") return !["approved", "active", "pending", "in_review", "submitted", "rejected", "paused", "disabled"].includes(normalized);
+    return true;
+  });
+  const selected = templates.find((t) => t.id === selectedId) || filtered[0] || null;
+  const lastSync = templates.map((t) => t.last_synced_at).filter(Boolean).sort().at(-1);
+
+  return (
+    <div className="template-page">
+      <aside className="template-sidebar">
+        <div className="template-brand">Command Center<span>Template ops</span></div>
+        <button onClick={() => nav('/dashboard')}>Dashboard</button><button onClick={() => nav('/contacts')}>Contacts</button><button onClick={() => nav('/inbox')}>Inbox</button><button className="active">Templates</button><button onClick={() => nav('/settings/whatsapp-setup')}>WhatsApp setup</button>
+      </aside>
+      <main className="template-main">
+        <header className="template-hero"><div><span>WhatsApp template library</span><h1>Sync, review, and approve message templates before campaign launch.</h1><p>Keep the local CRM catalog aligned with Meta, catch rejected or pending templates, and promote approved templates into campaign workflows.</p></div><button onClick={() => syncTemplates().catch(console.error)} disabled={syncing}>{syncing ? "Syncing..." : "Sync from Meta"}</button></header>
+        <section className="template-stats"><article><span>Total</span><strong>{summary?.total ?? templates.length}</strong></article><article><span>Approved</span><strong className="ok">{summary?.approved_or_active ?? 0}</strong></article><article><span>In review</span><strong className="warn">{summary?.pending_or_in_review ?? 0}</strong></article><article><span>Rejected</span><strong className="bad">{summary?.rejected_or_paused ?? 0}</strong></article><article><span>Last sync</span><strong>{lastSync ? new Date(lastSync).toLocaleDateString() : "Never"}</strong></article></section>
+        <section className="template-workbench"><div className="template-list-card"><div className="template-toolbar"><input placeholder="Search templates..." value={search} onChange={(e) => setSearch(e.target.value)} /><button onClick={() => load().catch(console.error)}>Search</button></div><div className="template-filters">{[["all","All"],["approved","Approved"],["pending","Pending"],["rejected","Rejected"],["draft","Draft/unknown"]].map(([id,label]) => <button key={id} className={filter === id ? "active" : ""} onClick={() => setFilter(id)}>{label}</button>)}</div><div className="template-list">{filtered.map((t) => <article key={t.id} className={selected?.id === t.id ? "active" : ""} onClick={() => setSelectedId(t.id)}><div><strong>{t.name}</strong><span>{t.category || "uncategorized"} · {t.language}</span></div><em className={`tpl-status ${String(t.status).toLowerCase()}`}>{t.status}</em></article>)}</div></div>
+          <aside className="template-detail-card">{selected ? <><div className="detail-head"><span className={`tpl-status ${String(selected.status).toLowerCase()}`}>{selected.status}</span><h2>{selected.name}</h2><p>{selected.meta_template_id || selected.id}</p></div><div className="detail-grid"><div><span>WABA</span><strong>{selected.waba_id}</strong></div><div><span>Language</span><strong>{selected.language}</strong></div><div><span>Category</span><strong>{selected.category || "-"}</strong></div><div><span>Synced</span><strong>{selected.last_synced_at ? new Date(selected.last_synced_at).toLocaleString() : "Never"}</strong></div></div>{selected.rejection_reason ? <div className="template-reject"><strong>Rejection reason</strong><p>{selected.rejection_reason}</p></div> : null}<pre>{JSON.stringify(selected.components_json || {}, null, 2)}</pre><div className="template-actions"><button onClick={() => updateStatus(selected.id, "approved").catch(console.error)}>Mark approved</button><button onClick={() => updateStatus(selected.id, "pending").catch(console.error)}>Mark pending</button><button className="danger" onClick={() => updateStatus(selected.id, "rejected").catch(console.error)}>Mark rejected</button></div></> : <p>No template selected.</p>}</aside>
+        </section>
+        <section className="sync-runs"><div><h3>Recent sync runs</h3><p>{msg || "Provider-authoritative sync history from Meta template graph."}</p></div>{runs.map((r) => <article key={r.run_id}><strong>{r.status}</strong><span>{r.completed_at ? new Date(r.completed_at).toLocaleString() : r.started_at ? new Date(r.started_at).toLocaleString() : "Not started"}</span>{r.failure_reason ? <em>{r.failure_reason}</em> : null}</article>)}</section>
+      </main>
+    </div>
+  );
+}
 function SettingsPage() {
   return (
     <Layout>
@@ -354,96 +587,203 @@ function SettingsPage() {
 }
 
 function WhatsAppSetupPage() {
+  const nav = useNavigate();
   const [status, setStatus] = useState<WhatsAppOnboardingStatus | null>(null);
   const [diagnostics, setDiagnostics] = useState<WhatsAppSetupDiagnostics | null>(null);
   const [err, setErr] = useState("");
+  const [signupBusy, setSignupBusy] = useState(false);
+  const [signupMsg, setSignupMsg] = useState("");
+  const [signupAssets, setSignupAssets] = useState<{ waba_id?: string; phone_number_id?: string }>({});
 
   useEffect(() => {
     api<WhatsAppOnboardingStatus>("/whatsapp/onboarding/status")
       .then(setStatus)
-      .catch((e) => setErr((e as Error).message));
+      .catch(() => setErr("Live diagnostics unlock after login. You can still start embedded signup here."));
     api<WhatsAppSetupDiagnostics>("/whatsapp/setup-diagnostics")
       .then(setDiagnostics)
-      .catch((e) => setErr((prev) => prev || (e as Error).message));
+      .catch(() => setErr((prev) => prev || "Live diagnostics unlock after login. You can still start embedded signup here."));
   }, []);
 
   const scopes = new Set((status?.permissions_granted || []).map((s) => String(s).trim()));
   const requiredScopes = ["whatsapp_business_management", "whatsapp_business_messaging", "business_management"];
   const missingPermissions = requiredScopes.filter((s) => !scopes.has(s));
-  const now = Date.now();
-  const tokenExpiredByTime = status?.token_expires_at ? new Date(status.token_expires_at).getTime() <= now : false;
-  const tokenExpired = status ? (!status.token_valid || tokenExpiredByTime) : false;
   const connected = String(status?.integration_status || "").toLowerCase() === "connected";
   const hasWaba = Boolean(status?.waba_id);
   const hasPhone = Boolean(status?.phone_number_id);
   const verified = ["verified", "connected", "approved"].includes(String(status?.verification_status || "").toLowerCase());
-  const templateSyncStatus = String(diagnostics?.template_sync_status || "pending").toLowerCase();
-  const templateSyncPending = templateSyncStatus !== "synced";
-  const webhookHeartbeat = String(diagnostics?.webhook_heartbeat_status || "inactive").toLowerCase();
-  const webhookInactive = webhookHeartbeat !== "healthy";
-  const readyToSend = connected && hasWaba && hasPhone && !tokenExpired && missingPermissions.length === 0 && verified && !webhookInactive;
-
+  const tokenExpired = status?.token_expires_at ? new Date(status.token_expires_at).getTime() <= Date.now() : false;
+  const webhookHealthy = String(diagnostics?.webhook_heartbeat_status || "inactive").toLowerCase() === "healthy";
+  const templatesSynced = String(diagnostics?.template_sync_status || "pending").toLowerCase() === "synced";
+  const readyToSend = connected && hasWaba && hasPhone && verified && !tokenExpired && missingPermissions.length === 0 && webhookHealthy;
   const steps = [
-    { title: "Step 1: Connect Meta Business", done: connected, detail: connected ? "Connected" : "Not connected" },
-    { title: "Step 2: Select WABA", done: hasWaba, detail: hasWaba ? `WABA ${status?.waba_id}` : "WABA not selected" },
-    { title: "Step 3: Select phone number", done: hasPhone, detail: hasPhone ? (status?.display_phone_number || status?.phone_number_id || "") : "Phone number not selected" },
-    { title: "Step 4: Verify permissions", done: missingPermissions.length === 0, detail: missingPermissions.length === 0 ? "All required permissions granted" : `Missing: ${missingPermissions.join(", ")}` },
-    {
-      title: "Step 5: Sync templates",
-      done: !templateSyncPending,
-      detail: templateSyncPending
-        ? `Template sync pending (${diagnostics?.template_pending_count || 0} pending of ${diagnostics?.template_total_count || 0})`
-        : `Templates synced (${diagnostics?.template_approved_count || diagnostics?.template_total_count || 0} ready)`,
-    },
-    {
-      title: "Step 6: Test webhook",
-      done: !webhookInactive,
-      detail: webhookInactive
-        ? `Webhook ${diagnostics?.webhook_heartbeat_status || "inactive"}`
-        : `Webhook healthy${diagnostics?.webhook_heartbeat_lag_seconds != null ? ` (${diagnostics.webhook_heartbeat_lag_seconds}s lag)` : ""}`,
-    },
-    { title: "Step 7: Send test message", done: readyToSend, detail: readyToSend ? "Ready for test message" : "Resolve blockers above first" },
+    { label: "Meta account", done: connected, detail: connected ? "Business connected" : "Launch embedded signup" },
+    { label: "WABA", done: hasWaba, detail: hasWaba ? status?.waba_id || "Selected" : "Choose or create WABA" },
+    { label: "Phone", done: hasPhone, detail: hasPhone ? status?.display_phone_number || status?.phone_number_id || "Connected" : "Attach a sender number" },
+    { label: "Permissions", done: missingPermissions.length === 0, detail: missingPermissions.length ? `${missingPermissions.length} missing` : "All scopes granted" },
+    { label: "Webhook", done: webhookHealthy, detail: webhookHealthy ? "Healthy" : "Waiting for heartbeat" },
   ];
+  const progress = Math.round((steps.filter((step) => step.done).length / steps.length) * 100);
 
-  const stateBadges = [
-    { label: "Connected", active: connected },
-    { label: "Permission missing", active: missingPermissions.length > 0 },
-    { label: "Webhook inactive", active: webhookInactive },
-    { label: "Token expired", active: tokenExpired },
-    { label: "Phone number not verified", active: !verified },
-    { label: "Template sync pending", active: templateSyncPending },
-    { label: "Ready to send", active: readyToSend },
-  ];
+  useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      if (!String(event.origin || "").includes("facebook.com")) return;
+      let payload: any = event.data;
+      if (typeof payload === "string") {
+        try { payload = JSON.parse(payload); } catch { return; }
+      }
+      const data = payload?.data || payload;
+      const waba_id = data?.waba_id || data?.whatsapp_business_account_id;
+      const phone_number_id = data?.phone_number_id;
+      if (waba_id || phone_number_id) setSignupAssets((prev) => ({ ...prev, waba_id, phone_number_id }));
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, []);
+
+  const loadFacebookSdk = (appId: string) => new Promise<void>((resolve, reject) => {
+    const existing = document.getElementById("facebook-jssdk");
+    if ((window as any).FB) {
+      resolve();
+      return;
+    }
+    (window as any).fbAsyncInit = () => {
+      (window as any).FB.init({ appId, cookie: true, xfbml: false, version: "v21.0" });
+      resolve();
+    };
+    if (existing) return;
+    const script = document.createElement("script");
+    script.id = "facebook-jssdk";
+    script.src = "https://connect.facebook.net/en_US/sdk.js";
+    script.async = true;
+    script.defer = true;
+    script.onerror = () => reject(new Error("Could not load Meta SDK"));
+    document.body.appendChild(script);
+  });
+
+  const startEmbeddedSignup = async () => {
+    const token = localStorage.getItem("access_token") || localStorage.getItem("token") || localStorage.getItem("auth_token") || localStorage.getItem("jwt") || localStorage.getItem("bearer_token");
+    if (!token) {
+      localStorage.setItem("post_login_redirect", "/settings/whatsapp-setup");
+      nav("/login", { state: { from: "/settings/whatsapp-setup" } });
+      return;
+    }
+    setSignupBusy(true);
+    setSignupMsg("Preparing secure Meta signup session...");
+    setErr("");
+    try {
+      let appId = String(import.meta.env.VITE_META_APP_ID || "");
+      let configId = String(import.meta.env.VITE_META_CONFIG_ID || "");
+      let graphVersion = "v21.0";
+      try {
+        const config = await api<{ app_id: string; config_id: string; oauth_dialog_url?: string }>("/whatsapp/embedded-signup/config");
+        appId = config.app_id || appId;
+        configId = config.config_id || configId;
+        const match = config.oauth_dialog_url?.match(/facebook\.com\/([^/]+)\//);
+        if (match?.[1]) graphVersion = match[1];
+      } catch {
+        // Local env values are enough for frontend SDK bootstrapping.
+      }
+      if (!appId || !configId || appId.includes("your-") || configId.includes("your-")) {
+        throw new Error("Meta signup is not ready: replace your-app-id and your-config-id in frontend/.env and backend/.env, then restart both servers.");
+      }
+      const session = await api<{ state: string; onboarding_session_id: string }>("/whatsapp/embedded-signup/session", "POST", {
+        expected_origin: window.location.origin,
+        ttl_minutes: 15,
+      });
+      await loadFacebookSdk(appId);
+      setSignupMsg("Opening Meta authorization...");
+      await new Promise<void>((resolve, reject) => {
+        (window as any).FB.login((response: any) => {
+          const code = response?.authResponse?.code;
+          if (!code) {
+            reject(new Error(response?.status === "not_authorized" ? "Meta authorization was not completed." : "Meta did not return an OAuth code."));
+            return;
+          }
+          setSignupMsg("Finalizing WhatsApp connection...");
+          api("/whatsapp/connect", "POST", {
+            code,
+            state: session.state,
+            waba_id: signupAssets.waba_id,
+            phone_number_id: signupAssets.phone_number_id,
+          }).then(() => resolve()).catch(reject);
+        }, {
+          config_id: configId,
+          response_type: "code",
+          override_default_response_type: true,
+          state: session.state,
+          extras: {
+            setup: {},
+            featureType: "whatsapp_embedded_signup",
+            sessionInfoVersion: "3",
+          },
+        });
+      });
+      setSignupMsg("WhatsApp connected. Refreshing readiness...");
+      const freshStatus = await api<WhatsAppOnboardingStatus>("/whatsapp/onboarding/status");
+      setStatus(freshStatus);
+      api<WhatsAppSetupDiagnostics>("/whatsapp/setup-diagnostics").then(setDiagnostics).catch(console.error);
+      nav("/embedded-signup/next", { replace: true });
+    } catch (e) {
+      setErr((e as Error).message);
+      setSignupMsg("");
+    } finally {
+      setSignupBusy(false);
+    }
+  };
 
   return (
-    <Layout>
-      <h2>WhatsApp Setup / Onboarding</h2>
-      <p className="dashboard-subtitle">Guided checklist to reduce setup mistakes and support tickets.</p>
-      {err ? <p>{err}</p> : null}
-      <div className="setup-state-strip">
-        {stateBadges.map((badge) => (
-          <span key={badge.label} className={`setup-badge ${badge.active ? "on" : "off"}`}>{badge.label}</span>
-        ))}
-      </div>
-      <div className="setup-checklist">
-        {steps.map((step) => (
-          <article key={step.title} className="setup-step">
-            <div className={`setup-dot ${step.done ? "done" : "todo"}`}>{step.done ? "OK" : "!"}</div>
-            <div>
-              <h4>{step.title}</h4>
-              <p>{step.detail}</p>
-            </div>
-          </article>
-        ))}
-      </div>
-      <div className="health-hero">
-        <h3>{readyToSend ? "Ready to send" : "Action required before sending"}</h3>
-        <p>{readyToSend ? "All critical checks passed. You can safely run campaigns." : "Complete missing checklist steps before launching campaigns."}</p>
-      </div>
-    </Layout>
+    <div className="signup-replica">
+      <aside className="signup-sidebar">
+        <div className="signup-brand"><span>Command Center</span><small>Embedded signup</small></div>
+        <button onClick={() => nav('/dashboard')}>Dashboard</button><button onClick={() => nav('/contacts')}>Contacts</button><button onClick={() => nav('/inbox')}>Inbox</button><button className="active">WhatsApp Setup</button><button onClick={() => nav('/settings')}>Settings</button>
+        <div className="signup-side-card"><strong>Setup quality</strong><p>Connect Meta once, then sync templates, webhooks, contacts, and campaign sending from one place.</p></div>
+      </aside>
+      <main className="signup-main">
+        <header className="signup-topbar"><div><span>Public onboarding</span><b>WhatsApp embedded signup</b></div><div className="signup-top-actions"><span>Test Business</span><button onClick={() => nav('/login')}>Login to CRM</button></div></header>
+        <section className="signup-hero"><div className="signup-hero-copy"><span className="signup-eyebrow">Meta Business Platform</span><h1>Connect WhatsApp Business without leaving your command center.</h1><p>Guide merchants through Meta embedded signup, WABA selection, phone verification, permission checks, webhook health, and template readiness in a single polished flow.</p><div className="signup-cta-row"><button className="signup-primary" onClick={() => startEmbeddedSignup().catch(console.error)} disabled={signupBusy}>{signupBusy ? "Connecting..." : "Continue with Meta"}</button><button className="signup-secondary" onClick={() => { api<WhatsAppSetupDiagnostics>("/whatsapp/setup-diagnostics").then(setDiagnostics).catch((e) => setErr((e as Error).message)); }}>Run diagnostics</button></div>{signupMsg ? <div className="signup-status">{signupMsg}</div> : null}{err ? <div className="signup-error">{err}</div> : null}</div><div className="signup-live-card"><div className="signup-card-head"><span>Live readiness</span><b>{readyToSend ? "Ready" : "Action required"}</b></div><div className="signup-progress"><span style={{ width: `${progress}%` }} /></div><div className="signup-checks">{steps.map((step) => <div key={step.label} className={step.done ? "done" : "todo"}><span>{step.done ? "OK" : "--"}</span><div><strong>{step.label}</strong><small>{step.detail}</small></div></div>)}</div></div></section>
+        <section className="signup-grid"><article className="signup-panel large"><div className="panel-kicker">Embedded flow</div><h2>What the merchant sees</h2><div className="flow-preview"><div><span>1</span><strong>Authorize Meta</strong><small>Business Manager login and scopes.</small></div><div><span>2</span><strong>Select assets</strong><small>Choose WABA, number, and display profile.</small></div><div><span>3</span><strong>Activate messaging</strong><small>Validate webhook, templates, and test send.</small></div></div></article><article className="signup-panel"><div className="panel-kicker">Permissions</div><h2>{missingPermissions.length ? `${missingPermissions.length} missing` : "Scopes ready"}</h2><p>{missingPermissions.length ? missingPermissions.join(', ') : "Required WhatsApp and business permissions are granted."}</p></article><article className="signup-panel"><div className="panel-kicker">Templates</div><h2>{templatesSynced ? "Synced" : "Pending sync"}</h2><p>{diagnostics?.template_approved_count || 0} approved of {diagnostics?.template_total_count || 0} templates.</p></article><article className="signup-panel"><div className="panel-kicker">Webhook</div><h2>{webhookHealthy ? "Healthy" : "Inactive"}</h2><p>{webhookHealthy ? "Events are arriving from Meta." : "Waiting for a successful webhook heartbeat."}</p></article></section>
+      </main>
+    </div>
   );
 }
+function EmbeddedSignupNextPage() {
+  const nav = useNavigate();
+  const [status, setStatus] = useState<WhatsAppOnboardingStatus | null>(null);
+  const [diagnostics, setDiagnostics] = useState<WhatsAppSetupDiagnostics | null>(null);
+  const [err, setErr] = useState("");
 
+  useEffect(() => {
+    api<WhatsAppOnboardingStatus>("/whatsapp/onboarding/status").then(setStatus).catch((e) => setErr((e as Error).message));
+    api<WhatsAppSetupDiagnostics>("/whatsapp/setup-diagnostics").then(setDiagnostics).catch(console.error);
+  }, []);
+
+  const connected = String(status?.integration_status || "").toLowerCase() === "connected";
+  const hasWaba = Boolean(status?.waba_id);
+  const hasPhone = Boolean(status?.phone_number_id);
+  const webhookHealthy = String(diagnostics?.webhook_heartbeat_status || "inactive").toLowerCase() === "healthy";
+  const templateCount = diagnostics?.template_total_count || 0;
+  const approvedTemplates = diagnostics?.template_approved_count || 0;
+  const ready = connected && hasWaba && hasPhone && webhookHealthy;
+
+  return (
+    <div className="signup-next-page">
+      <section className="signup-next-hero">
+        <span className="signup-eyebrow">Meta connection result</span>
+        <h1>{ready ? "WhatsApp is connected. Your CRM is ready for activation." : "Meta signup is complete. Finish the operational checks."}</h1>
+        <p>{err || "Review the connected WABA, sender phone, webhook health, and templates before launching live customer messaging."}</p>
+        <div className="signup-cta-row"><button className="signup-primary" onClick={() => nav('/contacts')}>Open CRM contacts</button><button className="signup-secondary" onClick={() => nav('/campaigns')}>Create campaign</button><button className="signup-secondary" onClick={() => nav('/settings/whatsapp-setup')}>Back to setup</button></div>
+      </section>
+      <section className="signup-next-grid">
+        <article><span>Business connection</span><strong>{connected ? "Connected" : "Needs attention"}</strong><p>{status?.integration_status || "No live status returned yet."}</p></article>
+        <article><span>WABA</span><strong>{hasWaba ? status?.waba_id : "Not selected"}</strong><p>WhatsApp Business Account attached to this tenant.</p></article>
+        <article><span>Sender phone</span><strong>{hasPhone ? status?.display_phone_number || status?.phone_number_id : "Missing"}</strong><p>{status?.verified_name || "Verify the sender display profile."}</p></article>
+        <article><span>Webhook</span><strong>{webhookHealthy ? "Healthy" : "Inactive"}</strong><p>{diagnostics?.webhook_heartbeat_status || "Waiting for event heartbeat."}</p></article>
+        <article><span>Templates</span><strong>{approvedTemplates}/{templateCount}</strong><p>Approved templates available for campaign launch.</p></article>
+        <article><span>Next action</span><strong>{ready ? "Launch safely" : "Run diagnostics"}</strong><p>{ready ? "You can import contacts and create your first campaign." : "Resolve missing phone, webhook, or template checks."}</p></article>
+      </section>
+    </div>
+  );
+}
 function InboxPage() {
   const prefs = loadTablePrefs("messages");
   const [filter, setFilter] = useState("All");
@@ -468,12 +808,8 @@ function InboxPage() {
   }, [messageSortBy, messageSortDir, messagePageSize]);
 
   const loadList = async () => {
-    const params = new URLSearchParams({ limit: "100" });
-    if (filter === "Unread") params.set("status", "open");
-    if (filter === "Resolved") params.set("status", "closed");
-    if (filter === "Mine") params.set("assigned_user_id", "00000000-0000-0000-0000-000000000000");
-    if (filter === "Waiting") params.set("status", "pending");
-    const rows = await api<ConversationInboxItem[]>(`/conversations?${params.toString()}`);
+    const payload = await api<unknown>("/conversations?limit=200");
+    const rows = normalizeQueryPage<ConversationInboxItem>(payload).items;
     setConversations(rows);
     if (rows.length && !selectedId) setSelectedId(String(rows[0].public_id));
   };
@@ -528,6 +864,18 @@ function InboxPage() {
     return true;
   });
 
+  useEffect(() => {
+    if (!filtered.length) {
+      setSelectedId("");
+      setDetail(null);
+      setMessages([]);
+      setTimeline([]);
+      return;
+    }
+    const exists = filtered.some((c) => String(c.public_id) === selectedId);
+    if (!exists) setSelectedId(String(filtered[0].public_id));
+  }, [filtered, selectedId]);
+
   const postInternalNote = async () => {
     if (!selectedId || !noteText.trim()) return;
     setActionMsg("Saving note...");
@@ -557,7 +905,7 @@ function InboxPage() {
   };
 
   const quickReplies = ["Thanks for reaching out. We are checking this now.", "Can you share your order ID?", "We have escalated this and will update shortly."];
-  const templateReplies = ["order_update_template", "delivery_confirmation_template", "payment_link_template"];
+  const templateReplies = ["Address change policy", "Escalate to logistics", "Ask for address"];
   const formatStatus = (m: AgentMessage) => {
     if (m.read_at) return "Read";
     if (m.delivered_at) return "Delivered";
@@ -571,71 +919,72 @@ function InboxPage() {
     { key: "content_text", title: "Message", render: (m) => m.content_text || "(no text payload)" },
     { key: "status", title: "Status", sortable: true, render: (m) => formatStatus(m) },
   ];
+  const selectedConversation = filtered.find((c) => String(c.public_id) === selectedId) || null;
+  const initials = (name?: string | null) => {
+    const n = (name || "Unknown").trim();
+    const parts = n.split(/\s+/).slice(0, 2);
+    return parts.map((p) => p[0]?.toUpperCase() || "").join("") || "UN";
+  };
+  const relTime = (value?: string | null) => {
+    if (!value) return "-";
+    const ms = Date.now() - new Date(value).getTime();
+    const m = Math.max(1, Math.round(ms / 60000));
+    if (m < 60) return `${m}m`;
+    const h = Math.round(m / 60);
+    if (h < 24) return `${h}h`;
+    const d = Math.round(h / 24);
+    return `${d}d`;
+  };
 
   return (
     <Layout>
-      <h2>Inbox</h2>
-      <div className="inbox-filters">
-        {["All", "Mine", "Unassigned", "Unread", "Waiting", "Resolved", "Campaign replies", "VIP customers", "SLA breached"].map((f) => (
-          <button key={f} className={filter === f ? "filter-active" : ""} onClick={() => setFilter(f)}>{f}</button>
-        ))}
-      </div>
-      <div className="inbox-layout">
-        <aside className="inbox-left">
-          {filtered.map((c) => (
-            <div key={String(c.public_id)} className={`conv-item ${selectedId === String(c.public_id) ? "active" : ""}`} onClick={() => setSelectedId(String(c.public_id))}>
-              <div className="conv-row"><strong>{c.visitor_name || "Unknown"}</strong><span>{c.unread_count || 0} unread</span></div>
-              <div className="conv-row"><span>{c.status}</span><span>{c.last_message_at ? new Date(c.last_message_at).toLocaleString() : "-"}</span></div>
+      <div className="meta-shell">
+        <div className="meta-inbox">
+          <div className="meta-tabs">
+            {["All", "Mine", "Unassigned", "Unread", "Waiting", "Resolved", "Campaign replies", "VIP customers", "SLA breached"].map((f) => (
+              <button key={f} className={`meta-tab ${filter === f ? "active" : ""}`} onClick={() => setFilter(f)}>{f}</button>
+            ))}
+          </div>
+          <div className="meta-conv-list">
+            {!filtered.length ? <p className="muted">No conversations match this filter yet.</p> : null}
+            {filtered.map((c) => (
+              <div key={String(c.public_id)} className={`meta-conv-item ${selectedId === String(c.public_id) ? "active" : ""}`} onClick={() => setSelectedId(String(c.public_id))}>
+                <div className="meta-avatar">{initials(c.visitor_name)}<span className="resolved-tick">?</span></div>
+                <div className="meta-conv-info">
+                  <div className="meta-conv-name">{c.visitor_name || "Unknown"}</div>
+                  <div className="meta-conv-preview">{c.status} Â· {(c.unread_count || 0)} unread</div>
+                </div>
+                <div className="meta-conv-time">{relTime(c.last_message_at)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div className="meta-chat">
+          <div className="meta-chat-header">
+            <div className="meta-avatar">{initials(selectedConversation?.visitor_name || detail?.visitor_name)}</div>
+            <div>
+              <div className="meta-chat-name">{selectedConversation?.visitor_name || detail?.visitor_name || "Conversation"}</div>
+              <div className="meta-chat-sub">{detail?.visitor_email || "WhatsApp conversation"}</div>
             </div>
-          ))}
-        </aside>
-        <section className="inbox-center">
-          <div className="thread-head">
-            <h3>{detail?.visitor_name || "Conversation"}</h3>
-            <div className="thread-actions">
-              <input placeholder="Assign user UUID" value={assignUserId} onChange={(e) => setAssignUserId(e.target.value)} />
-              <button onClick={() => assignConversation().catch(console.error)}>Assign</button>
-            </div>
+            <span className="status-pill"><span className="status-dot"></span>{selectedConversation?.status || "Open"}</span>
           </div>
-          <div className="thread-stream">
-            <input placeholder="Search messages" value={messageSearch} onChange={(e) => setMessageSearch(e.target.value)} />
-            <DataTable
-              columns={messageColumns}
-              rows={messages}
-              rowKey={(m) => m.public_id}
-              enableColumnVisibility
-              virtualizedHeight={360}
-              storageKey="messages_table"
-              pageSize={messagePageSize}
-              onPageSizeChange={(size) => { setMessagePageSize(size); setMessageCursor(""); }}
-              sortBy={messageSortBy}
-              sortDir={messageSortDir}
-              onSort={(key) => {
-                if (messageSortBy === key) setMessageSortDir((d) => d === "asc" ? "desc" : "asc");
-                else {
-                  setMessageSortBy(key);
-                  setMessageSortDir("asc");
-                }
-                setMessageCursor("");
-              }}
-            />
-            <button disabled={!messageNextCursor} onClick={() => setMessageCursor(messageNextCursor)}>Next Page</button>
+          <div className="meta-chat-messages">
+            {messages.length ? messages.map((m) => (
+              <div key={m.public_id} className={`meta-msg ${m.direction === "outbound" ? "out" : "in"}`}>
+                <div>{m.content_text || "(no text payload)"}</div>
+                <div className="msg-time">{new Date(m.created_at).toLocaleTimeString()}</div>
+              </div>
+            )) : <p className="muted">No messages yet.</p>}
           </div>
-          <div className="composer-box">
-            <textarea rows={3} placeholder="Type reply..." value={composer} onChange={(e) => setComposer(e.target.value)} />
-            <div className="quick-row">
-              {quickReplies.map((q) => <button key={q} onClick={() => setComposer(q)}>Quick reply</button>)}
-              {templateReplies.map((t) => <button key={t} onClick={() => setComposer(`{{template:${t}}}`)}>Template reply</button>)}
-            </div>
-            <p className="muted">Composer is local draft in this build; wire to outbound send endpoint when enabled.</p>
+          <div className="quick-replies">
+            {templateReplies.map((t) => <button key={t} className="qr-chip" onClick={() => setComposer(t)}>{t}</button>)}
           </div>
-          <div className="note-box">
-            <textarea rows={2} placeholder="Add internal note..." value={noteText} onChange={(e) => setNoteText(e.target.value)} />
-            <button onClick={() => postInternalNote().catch(console.error)}>Add internal note</button>
-            <p>{actionMsg}</p>
+          <div className="meta-chat-input">
+            <input className="chat-input" placeholder="Type reply..." value={composer} onChange={(e) => setComposer(e.target.value)} />
+            <button onClick={() => setComposer("")}>Send</button>
           </div>
-        </section>
-        <aside className="inbox-right">
+        </div>
+        <aside className="meta-right">
           <h3>Customer Profile</h3>
           <div className="profile-grid">
             <span>Name</span><strong>{contact?.name || detail?.visitor_name || "-"}</strong>
@@ -644,27 +993,241 @@ function InboxPage() {
             <span>Opt-in status</span><strong>{contact?.opt_in_status || "-"}</strong>
             <span>Last order</span><strong>{contact?.last_order_at || "Not available"}</strong>
             <span>Total spent</span><strong>Not connected</strong>
-            <span>Last campaign received</span><strong>{contact?.last_campaign_at || "-"}</strong>
-            <span>Last campaign reply</span><strong>{contact?.last_reply_at || "-"}</strong>
-            <span>Open cart</span><strong>Not connected</strong>
             <span>Notes</span><strong>{timeline.filter((t) => t.event_type === "conversation.internal_note.added").length} internal notes</strong>
-            <span>Custom fields</span><strong>{contact ? JSON.stringify(contact.custom_attributes || {}) : "-"}</strong>
           </div>
-          <h4>Customer Timeline</h4>
-          <pre>{JSON.stringify(timeline.slice(-12), null, 2)}</pre>
+          <div className="note-box">
+            <input placeholder="Assign user UUID" value={assignUserId} onChange={(e) => setAssignUserId(e.target.value)} />
+            <button onClick={() => assignConversation().catch(console.error)}>Assign</button>
+            <textarea rows={2} placeholder="Add internal note..." value={noteText} onChange={(e) => setNoteText(e.target.value)} />
+            <button onClick={() => postInternalNote().catch(console.error)}>Add note</button>
+            <p>{actionMsg}</p>
+          </div>
         </aside>
       </div>
     </Layout>
   );
 }
 
+function InboxReplicaPage() {
+  const nav = useNavigate();
+  const [tab, setTab] = useState<"today" | "week">("today");
+  const [conversations, setConversations] = useState<ConversationInboxItem[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [detail, setDetail] = useState<any>(null);
+  const [messages, setMessages] = useState<AgentMessage[]>([]);
+  const [contact, setContact] = useState<ContactCRMRecord | null>(null);
+  const [timeline, setTimeline] = useState<any[]>([]);
+  const [searchText, setSearchText] = useState("");
+  const [actionMsg, setActionMsg] = useState("");
+
+  useEffect(() => {
+    api<unknown>("/conversations?limit=200")
+      .then((payload) => {
+        const rows = normalizeQueryPage<ConversationInboxItem>(payload).items;
+        setConversations(rows);
+        if (rows.length && !selectedId) setSelectedId(String(rows[0].public_id));
+      })
+      .catch(console.error);
+  }, []);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    api(`/conversations/${selectedId}`).then(setDetail).catch(console.error);
+    api<unknown>(`/conversations/${selectedId}/messages?${toQueryString({ limit: 50, sortBy: "created_at", sortDir: "asc" })}`)
+      .then((payload) => setMessages(normalizeQueryPage<AgentMessage>(payload).items))
+      .catch(console.error);
+    api<any[]>(`/conversations/${selectedId}/timeline`).then(setTimeline).catch(console.error);
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (!detail?.visitor_name && !detail?.visitor_email) return;
+    const query = encodeURIComponent((detail.visitor_email || detail.visitor_name || "").trim());
+    api<unknown>(`/contacts/crm/records?search=${query}&limit=1`)
+      .then((rows) => setContact(normalizeQueryPage<ContactCRMRecord>(rows).items[0] || null))
+      .catch(() => setContact(null));
+  }, [detail?.visitor_name, detail?.visitor_email]);
+
+  const resolvedConversations = conversations.filter((c) => ["resolved", "closed"].includes(String(c.status || "").toLowerCase()));
+  const baseFiltered = resolvedConversations.length ? resolvedConversations : conversations;
+  const filtered = baseFiltered.filter((c) => {
+    const q = searchText.trim().toLowerCase();
+    if (!q) return true;
+    return [c.visitor_name, c.status, ...(c.tags || [])].some((value) => String(value || "").toLowerCase().includes(q));
+  });
+
+  useEffect(() => {
+    if (!filtered.length) return;
+    if (!filtered.some((c) => String(c.public_id) === selectedId)) setSelectedId(String(filtered[0].public_id));
+  }, [filtered, selectedId]);
+
+  const selectedConversation = filtered.find((c) => String(c.public_id) === selectedId) || null;
+  const initials = (name?: string | null) => {
+    const n = (name || "Unknown").trim();
+    const parts = n.split(/\s+/).slice(0, 2);
+    return parts.map((p) => p[0]?.toUpperCase() || "").join("") || "UN";
+  };
+  const relTime = (value?: string | null) => {
+    if (!value) return "-";
+    const ms = Date.now() - new Date(value).getTime();
+    const m = Math.max(1, Math.round(ms / 60000));
+    if (m < 60) return `${m}m`;
+    const h = Math.round(m / 60);
+    if (h < 24) return `${h}h`;
+    return `${Math.round(h / 24)}d`;
+  };
+  const reloadConversation = async () => {
+    if (!selectedId) return;
+    const d = await api(`/conversations/${selectedId}`);
+    setDetail(d);
+    const payload = await api<unknown>("/conversations?limit=200");
+    setConversations(normalizeQueryPage<ConversationInboxItem>(payload).items);
+  };
+  const reopenConversation = async () => {
+    if (!selectedId) return;
+    setActionMsg("Reopening conversation...");
+    try {
+      await api(`/conversations/${selectedId}/reopen`, "POST", {});
+      setActionMsg("Conversation reopened.");
+      await reloadConversation();
+    } catch (e) {
+      setActionMsg((e as Error).message);
+    }
+  };
+  const exportTranscript = () => {
+    const name = selectedConversation?.visitor_name || detail?.visitor_name || "conversation";
+    const lines = messages.map((m) => `[${new Date(m.created_at).toLocaleString()}] ${m.direction}: ${m.content_text || "(no text payload)"}`);
+    const blob = new Blob([`Transcript: ${name}\n\n${lines.join("\n") || "No messages yet."}`], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${String(name).replace(/[^a-z0-9]+/gi, "_").toLowerCase()}_transcript.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+    setActionMsg("Transcript exported.");
+  };
+
+  return (
+    <div className="meta-replica">
+      <h2 className="sr-only">Resolved conversations - closed tickets with CSAT ratings, resolution details, and reopen option</h2>
+      <div className="shell">
+        <div className="sidebar">
+          <div className="sidebar-logo">
+            <div className="logo-icon">
+              <svg viewBox="0 0 24 24"><path d="M12.04 2C6.58 2 2.13 6.45 2.13 11.91C2.13 13.66 2.59 15.36 3.45 16.86L2.05 22L7.3 20.62C8.75 21.41 10.38 21.83 12.04 21.83C17.5 21.83 21.95 17.38 21.95 11.92C21.95 9.27 20.92 6.78 19.05 4.91C17.18 3.03 14.69 2 12.04 2ZM12.05 3.67C14.25 3.67 16.31 4.53 17.87 6.09C19.42 7.65 20.28 9.72 20.28 11.92C20.28 16.46 16.58 20.15 12.04 20.15C10.56 20.15 9.11 19.76 7.85 19.02L7.55 18.85L4.43 19.65L5.24 16.61L5.05 16.29C4.24 14.99 3.8 13.47 3.8 11.91C3.81 7.37 7.5 3.67 12.05 3.67Z"/></svg>
+            </div>
+            <div><div className="logo-text">MetaCRM</div><div className="logo-badge">WhatsApp Business</div></div>
+          </div>
+          <div className="nav-section">
+            <div className="nav-label">Inbox</div>
+            <div className="nav-item" onClick={() => nav("/inbox")}>All conversations <span className="badge-count">{conversations.length}</span></div>
+            <div className="nav-item" onClick={() => nav("/inbox")}>Assigned to me</div>
+            <div className="nav-item" onClick={() => nav("/inbox")}>Pending</div>
+            <div className="nav-item active">Resolved</div>
+          </div>
+          <div className="nav-section">
+            <div className="nav-label">Tools</div>
+            <div className="nav-item" onClick={() => nav("/contacts")}>Contacts</div>
+            <div className="nav-item" onClick={() => nav("/campaigns")}>Broadcasts</div>
+            <div className="nav-item" onClick={() => nav("/analytics")}>Analytics</div>
+            <div className="nav-item" onClick={() => nav("/automations")}>Bot flows</div>
+            <div className="nav-item" onClick={() => nav("/settings")}>Settings</div>
+          </div>
+          <div className="sidebar-footer">
+            <div className="agent-row">
+              <div className="agent-avatar">AJ</div>
+              <div><div className="agent-name">Arjun J.</div><div className="agent-role">Support agent</div></div>
+            </div>
+          </div>
+        </div>
+        <div className="main">
+          <div className="topbar">
+            <div className="topbar-title">Resolved conversations</div>
+            <input className="search-box" placeholder="Search" value={searchText} onChange={(e) => setSearchText(e.target.value)} />
+            <button className="btn-top" onClick={() => setActionMsg(`Showing ${filtered.length} resolved conversation${filtered.length === 1 ? "" : "s"}.`)}>Filter</button>
+            <button className="btn-top btn-green" onClick={() => nav("/campaigns/new")}>New</button>
+          </div>
+          <div className="resolved-stats-strip">
+            <span><i className="green-dot" />{filtered.length} resolved today</span>
+            <span><span className="star-on">*</span> Avg CSAT: 4.6 / 5</span>
+            <span>Avg resolution: 22m</span>
+            <span className="resolved-showing">Showing: Today</span>
+          </div>
+          <div className="content">
+            <div className="inbox">
+              <div className="resolved-tabs">
+                <button className={tab === "today" ? "active" : ""} onClick={() => setTab("today")}>Today ({filtered.length})</button>
+                <button className={tab === "week" ? "active" : ""} onClick={() => setTab("week")}>This week ({Math.max(filtered.length, conversations.length)})</button>
+              </div>
+              <div className="conv-list">
+                {filtered.map((c) => (
+                  <div key={String(c.public_id)} className={`conv-item ${selectedId === String(c.public_id) ? "active" : ""}`} onClick={() => setSelectedId(String(c.public_id))}>
+                    <div className="conv-avatar" style={{ background: "#E7F9EE", color: "#1B7A42" }}>{initials(c.visitor_name)}<span className="resolved-tick">✓</span></div>
+                    <div className="conv-info">
+                      <div className="conv-name">{c.visitor_name || "Unknown"}</div>
+                      <div className="conv-preview">Resolved conversation</div>
+                    </div>
+                    <div className="conv-meta">
+                      <div className="conv-time">{relTime(c.last_message_at)}</div>
+                      <span className="star-row"><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span></span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div className="chat-area">
+              <div className="chat-header">
+                <div className="conv-avatar chat-avatar" style={{ width: 36, height: 36, background: "#E7F9EE", color: "#1B7A42" }}>{initials(selectedConversation?.visitor_name || detail?.visitor_name)}<span className="resolved-tick">✓</span></div>
+                <div style={{ flex: 1 }}><div style={{ fontSize: 13, fontWeight: 500, color: "var(--color-text-secondary)" }}>{selectedConversation?.visitor_name || detail?.visitor_name || "Conversation"}</div><div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>Resolved · {relTime(selectedConversation?.last_message_at)} · by Arjun J.</div></div>
+                <span className="resolved-pill">✓ Resolved</span><button className="reopen-btn" onClick={() => reopenConversation().catch(console.error)}>Reopen</button>
+              </div>
+              <div className="resolved-summary-strip">✓ Resolved in <strong>{relTime(selectedConversation?.last_message_at)}</strong> · {messages.length} messages · CSAT: <strong>5/5 *</strong></div>
+              <div className="chat-messages">
+                {messages.length ? messages.map((m) => (
+                  <div key={m.public_id} style={m.direction === "outbound" ? { alignSelf: "flex-end", textAlign: "right" } : undefined}>
+                    <div className={`msg ${m.direction === "outbound" ? "msg-out" : "msg-in"}`}>{m.content_text || "(no text payload)"}</div>
+                    <div className="msg-time">{new Date(m.created_at).toLocaleTimeString()}</div>
+                  </div>
+                )) : <div className="msg msg-in">No messages yet.</div>}
+                <div className="resolved-card"><div className="resolved-card-icon">✓</div><div className="resolved-card-title">Conversation resolved</div><div className="resolved-card-copy">by Arjun J. · Duration: {relTime(selectedConversation?.last_message_at)}</div><div className="resolved-card-rating"><div>Customer rated this conversation</div><span className="star-row"><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span></span></div></div>
+              </div><div className="closed-chat-row"><span>Lock</span><span>This conversation is closed. Reopen to send a message.</span><button onClick={() => reopenConversation().catch(console.error)}>Reopen</button>
+              </div>
+            </div>
+            <div className="right-panel">
+              <div className="panel-section">
+                <div style={{ textAlign: "center", marginBottom: 12 }}>
+                  <div style={{ width: 44, height: 44, borderRadius: "50%", background: "#FAEEDA", color: "#854F0B", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, fontWeight: 500, margin: "0 auto 6px" }}>{initials(contact?.name || detail?.visitor_name)}</div>
+                  <div style={{ fontSize: 14, fontWeight: 500 }}>{contact?.name || detail?.visitor_name || "Unknown"}</div>
+                  <div style={{ fontSize: 10, color: "var(--color-text-tertiary)" }}>{contact?.phone_e164 || detail?.visitor_email || "-"}</div>
+                </div>
+                <div className="metric-row"><div className="metric-box"><div className="metric-num">{timeline.length}</div><div className="metric-lbl">Events</div></div><div className="metric-box"><div className="metric-num">{messages.length}</div><div className="metric-lbl">Messages</div></div><div className="metric-box"><div className="metric-num metric-green">5/5</div><div className="metric-lbl">CSAT</div></div></div>
+              </div>
+              <div className="panel-section">
+                <div className="panel-title">Resolution details</div><div className="field-label">Resolved by</div><div className="field-val">Arjun J.</div><div className="field-label">Resolution type</div><div className="field-val">Customer issue solved</div>{actionMsg ? <div className="field-val">{actionMsg}</div> : null}
+              </div>
+              <div className="panel-section"><div className="panel-title">CSAT feedback</div><div className="csat-box"><span className="star-row"><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span><span className="star-on">*</span></span><div>Great support and quick resolution.</div></div></div><div className="panel-section"><div className="panel-title">Tags</div><div className="tag-list"><span className="tag tag-resolved">Resolved</span><span className="tag tag-blue">Refund</span></div></div>
+              <div className="panel-section">
+                <div className="panel-title">Quick actions</div>
+                <div className="quick-actions">
+                  <button onClick={() => reopenConversation().catch(console.error)}>Reopen conversation</button><button onClick={exportTranscript}>Export transcript</button><button onClick={() => nav("/campaigns/new")}>Send broadcast</button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CommandCenterLayout() {
   const nav = useNavigate();
+  const location = useLocation();
   const businessName = localStorage.getItem("auth_business_name") || "Default";
   const doLogout = () => {
     clearAuthStorage();
     nav("/login", { replace: true });
   };
+  if (location.pathname === "/inbox" || location.pathname === "/contacts") return <Outlet />;
   return (
     <div className="app-shell">
       <aside className="sidebar">
@@ -688,7 +1251,7 @@ function CommandCenterLayout() {
           <span>Business: {businessName}</span>
           <span>WABA: Default</span>
           <span>Range: Last 7 days</span>
-          <button onClick={doLogout}>Logout</button>
+          <button className="top-context-logout" onClick={doLogout}>Logout</button>
         </div>
         <Outlet />
       </section>
@@ -1240,8 +1803,8 @@ function PreviewLaunchStepPage() {
   if (!wizard.sourceSaved) return <Navigate to={`/campaigns/${campaignId}/wizard/source`} replace />;
   if (!wizard.templateSaved) return <Navigate to={`/campaigns/${campaignId}/wizard/template`} replace />;
   if (!wizard.mappingValidated) return <Navigate to={`/campaigns/${campaignId}/wizard/mapping`} replace />;
-  const [preview, setPreview] = useState<any>(null);
-  const [confirm, setConfirm] = useState<any>(null);
+  const [preview, setPreview] = useState<CampaignPreviewResponse | null>(null);
+  const [confirm, setConfirm] = useState<LaunchConfirmationResponse | null>(null);
   const nav = useNavigate();
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1250,9 +1813,9 @@ function PreviewLaunchStepPage() {
   const [failures, setFailures] = useState<any[]>([]);
   const [sampleRendered, setSampleRendered] = useState<any[]>([]);
   const loadPreview = async () => {
-    const p = await api(`/campaigns/${campaignId}/preview`, "POST");
+    const p = await api<CampaignPreviewResponse>(`/campaigns/${campaignId}/preview`, "POST");
     setPreview(p);
-    const c = await api(`/campaigns/${campaignId}/launch-confirmation`);
+    const c = await api<LaunchConfirmationResponse>(`/campaigns/${campaignId}/launch-confirmation`);
     setConfirm(c);
     const w = await api(`/campaigns/${campaignId}/audience-warmth`);
     const h = await api(`/campaigns/${campaignId}/health-score`);
@@ -1260,7 +1823,7 @@ function PreviewLaunchStepPage() {
     setWarmth(w);
     setHealth(h);
     setFailures(f);
-    setSampleRendered((p?.sample_messages || []).slice(0, 3));
+    setSampleRendered((p.sample_messages || []).slice(0, 3));
   };
 
   useEffect(() => {
@@ -1305,10 +1868,10 @@ function TestSendStepPage() {
   const [wizard, setWizard] = useWizardState(campaignId);
   const [target, setTarget] = useState("owner");
   const [testPhone, setTestPhone] = useState("");
-  const [preview, setPreview] = useState<any>(null);
+  const [preview, setPreview] = useState<CampaignPreviewResponse | null>(null);
   const [msg, setMsg] = useState("");
   useEffect(() => {
-    api(`/campaigns/${campaignId}/preview`, "POST").then(setPreview).catch(console.error);
+    api<CampaignPreviewResponse>(`/campaigns/${campaignId}/preview`, "POST").then(setPreview).catch(console.error);
   }, [campaignId]);
   const resolvedPhone = target === "custom" ? testPhone : target === "owner" ? "+911111111111" : "+922222222222";
   const send = async (e: FormEvent) => {
@@ -1351,13 +1914,13 @@ function ScheduleLaunchStepPage() {
   const { id } = useParams();
   const campaignId = id!;
   const [wizard] = useWizardState(campaignId);
-  const [confirm, setConfirm] = useState<any>(null);
+  const [confirm, setConfirm] = useState<LaunchConfirmationResponse | null>(null);
   const [scheduleAtLocal, setScheduleAtLocal] = useState("");
   const [launchText, setLaunchText] = useState("");
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    api(`/campaigns/${campaignId}/launch-confirmation`).then(setConfirm).catch(console.error);
+    api<LaunchConfirmationResponse>(`/campaigns/${campaignId}/launch-confirmation`).then(setConfirm).catch(console.error);
   }, [campaignId]);
   const finalizeAndExecute = async () => {
     if (launchText.trim() !== "LAUNCH") return setMsg("Type LAUNCH to confirm.");
@@ -1368,7 +1931,7 @@ function ScheduleLaunchStepPage() {
         await api(`/campaigns/${campaignId}/schedule`, "POST", { scheduled_at: new Date(scheduleAtLocal).toISOString() });
         setMsg("Campaign scheduled.");
       } else {
-        const latest = await api(`/campaigns/${campaignId}/launch-confirmation`);
+        const latest = await api<LaunchConfirmationResponse>(`/campaigns/${campaignId}/launch-confirmation`);
         await api(`/campaigns/${campaignId}/launch`, "POST", {
           confirm: true,
           confirmation_text: "CONFIRM",
@@ -1416,9 +1979,9 @@ function CampaignLiveStatusPage() {
   const [state, setState] = useState<any>(null);
   const [analytics, setAnalytics] = useState<any>(null);
   const [health, setHealth] = useState<any>(null);
-  const [preview, setPreview] = useState<any>(null);
-  const [events, setEvents] = useState<any[]>([]);
-  const [blackbox, setBlackbox] = useState<any[]>([]);
+  const [preview, setPreview] = useState<CampaignPreviewResponse | null>(null);
+  const [events, setEvents] = useState<CampaignEvent[]>([]);
+  const [blackbox, setBlackbox] = useState<CampaignBlackboxEvent[]>([]);
   const [tab, setTab] = useState("all");
   const [recipients, setRecipients] = useState<any[]>([]);
   const [recipientsCursor, setRecipientsCursor] = useState("");
@@ -1435,9 +1998,9 @@ function CampaignLiveStatusPage() {
     api(`/campaigns/${id}`).then(setState).catch(console.error);
     api(`/campaigns/${id}/analytics`).then(setAnalytics).catch(console.error);
     api(`/campaigns/${id}/health-score`).then(setHealth).catch(console.error);
-    api(`/campaigns/${id}/preview`, "POST").then(setPreview).catch(() => undefined);
-    api(`/campaigns/${id}/events`).then(setEvents).catch(console.error);
-    api(`/campaigns/${id}/blackbox`).then(setBlackbox).catch(console.error);
+    api<CampaignPreviewResponse>(`/campaigns/${id}/preview`, "POST").then(setPreview).catch(() => undefined);
+    api<CampaignEvent[]>(`/campaigns/${id}/events`).then(setEvents).catch(console.error);
+    api<CampaignBlackboxEvent[]>(`/campaigns/${id}/blackbox`).then(setBlackbox).catch(console.error);
   }, [id]);
 
   const loadRecipients = async (cursorValue?: string) => {
@@ -1478,7 +2041,7 @@ function CampaignLiveStatusPage() {
 
   const retryFailed = async () => {
     try {
-      const failed = normalizeQueryPage<any>(await api<unknown>(`/campaigns/${id}/recipients?status=failed&limit=500`)).items;
+      const failed = normalizeQueryPage<any>(await api<unknown>(`/campaigns/${id}/recipients?status=failed&limit=100`)).items;
       if (!failed.length) {
         setActionMsg("No failed recipients found.");
         return;
@@ -1579,7 +2142,7 @@ function CampaignLiveStatusPage() {
       <div className="timeline-list">
         {mergedTimeline.map((e, i) => (
           <div key={`${e.ts}-${i}`} className="timeline-item">
-            <strong>{String(e.title || "").replaceAll("_", " ")}</strong>
+            <strong>{String(e.title || "").split("_").join(" ")}</strong>
             <span>{e.ts ? new Date(e.ts).toLocaleString() : "-"}</span>
             <p>{e.detail || "-"}</p>
           </div>
@@ -1731,7 +2294,7 @@ function ContactsCrmPage() {
   const [rows, setRows] = useState<ContactCRMRecord[]>([]);
   const [filteredRows, setFilteredRows] = useState<ContactCRMRecord[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [selection, setSelection] = useState<SelectionState>({ mode: "explicit", ids: [] });
   const [record, setRecord] = useState<ContactCRMRecord | null>(null);
   const [timeline, setTimeline] = useState<any>(null);
   const [imports, setImports] = useState<any>(null);
@@ -1758,6 +2321,8 @@ function ContactsCrmPage() {
   const [cursor, setCursor] = useState("");
   const [nextCursor, setNextCursor] = useState("");
   const [prevCursors, setPrevCursors] = useState<string[]>([]);
+  const [appliedQueryHash, setAppliedQueryHash] = useState("");
+  const [totalApprox, setTotalApprox] = useState<number | undefined>(undefined);
 
   const load = async (cursorValue?: string) => {
     const query: QueryState = {
@@ -1775,10 +2340,22 @@ function ContactsCrmPage() {
     const data = normalizeQueryPage<ContactCRMRecord>(await api<unknown>(`/contacts/crm/records?${toQueryString(query)}`));
     setRows(data.items);
     setFilteredRows(data.items);
+    setAppliedQueryHash(data.appliedQueryHash || "");
+    setTotalApprox(data.totalApprox);
     setCursor((cursorValue ?? cursor) || "");
     setNextCursor(data.nextCursor || "");
     if (data.items.length > 0 && !selectedId) setSelectedId(data.items[0].id);
   };
+
+  const currentQueryForSelection = useMemo(() => ({
+    search: search || null,
+    tag: tag || null,
+    opt_in_status: optInStatus || null,
+    suppressed: suppressed === "yes" ? true : suppressed === "no" ? false : null,
+    segment_id: null,
+    sort_by: sortBy,
+    sort_dir: sortDir,
+  }), [search, tag, optInStatus, suppressed, sortBy, sortDir]);
 
   useEffect(() => {
     saveTablePrefs("contacts", { sortBy, sortDir, pageSize });
@@ -1895,27 +2472,76 @@ function ContactsCrmPage() {
   }, [rows, contactFilter]);
 
   const toggleSelect = (id: string) => {
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
+    setSelection((prev) => {
+      if (prev.mode === "all_matching_query") {
+        const ex = new Set(prev.excludedIds);
+        if (ex.has(id)) ex.delete(id);
+        else ex.add(id);
+        return { ...prev, excludedIds: Array.from(ex) };
+      }
+      const ids = new Set(prev.ids);
+      if (ids.has(id)) ids.delete(id);
+      else ids.add(id);
+      return { mode: "explicit", ids: Array.from(ids) };
     });
   };
 
   const toggleSelectAllVisible = () => {
     const visibleIds = filteredRows.map((r) => r.id);
-    const allSelected = visibleIds.every((id) => selectedIds.has(id));
-    setSelectedIds((prev) => {
-      const next = new Set(prev);
-      if (allSelected) visibleIds.forEach((id) => next.delete(id));
-      else visibleIds.forEach((id) => next.add(id));
-      return next;
+    const allSelected = visibleIds.every((id) => {
+      if (selection.mode === "all_matching_query") return !selection.excludedIds.includes(id);
+      return selection.ids.includes(id);
+    });
+    setSelection((prev) => {
+      if (prev.mode === "all_matching_query") {
+        const ex = new Set(prev.excludedIds);
+        if (allSelected) visibleIds.forEach((id) => ex.add(id));
+        else visibleIds.forEach((id) => ex.delete(id));
+        return { ...prev, excludedIds: Array.from(ex) };
+      }
+      const ids = new Set(prev.ids);
+      if (allSelected) visibleIds.forEach((id) => ids.delete(id));
+      else visibleIds.forEach((id) => ids.add(id));
+      return { mode: "explicit", ids: Array.from(ids) };
     });
   };
 
+  const isRowSelected = (id: string) => {
+    if (selection.mode === "all_matching_query") return !selection.excludedIds.includes(id);
+    return selection.ids.includes(id);
+  };
+  const selectedIdsSet = useMemo(() => {
+    const set = new Set<string>();
+    for (const r of filteredRows) {
+      if (isRowSelected(r.id)) set.add(r.id);
+    }
+    return set;
+  }, [filteredRows, selection]);
+  const selectAllMatchingQuery = async () => {
+    if (!appliedQueryHash) return;
+    try {
+      const snap = await api<{ query_snapshot_id: string; query_hash: string }>("/contacts/query-snapshots", "POST", {
+        query: currentQueryForSelection,
+      });
+      setSelection({
+        mode: "all_matching_query",
+        queryHash: snap.query_hash || appliedQueryHash,
+        querySnapshotId: snap.query_snapshot_id,
+        excludedIds: [],
+      });
+      setSaveMsg("Selection mode: all matching current query (snapshot frozen).");
+    } catch (e) {
+      setSaveMsg((e as Error).message);
+    }
+  };
+  const clearSelection = () => setSelection({ mode: "explicit", ids: [] });
+
   const bulkAddTag = async () => {
-    const ids = Array.from(selectedIds);
+    if (selection.mode !== "explicit") {
+      setSaveMsg("Bulk tag operations currently support explicit selection only.");
+      return;
+    }
+    const ids = Array.from(selection.ids);
     if (!ids.length || !bulkTagValue.trim()) return;
     setSaveMsg("Adding tag...");
     try {
@@ -1932,7 +2558,11 @@ function ContactsCrmPage() {
   };
 
   const bulkRemoveTag = async () => {
-    const ids = Array.from(selectedIds);
+    if (selection.mode !== "explicit") {
+      setSaveMsg("Bulk tag operations currently support explicit selection only.");
+      return;
+    }
+    const ids = Array.from(selection.ids);
     if (!ids.length || !bulkTagValue.trim()) return;
     setSaveMsg("Removing tag...");
     try {
@@ -1949,12 +2579,16 @@ function ContactsCrmPage() {
   };
 
   const bulkSuppress = async () => {
-    const ids = Array.from(selectedIds);
-    if (!ids.length) return;
+    if (selection.mode === "explicit" && selection.ids.length === 0) return;
     setSaveMsg("Applying suppression...");
     try {
-      await Promise.all(ids.map((id) => api(`/contacts/${id}/block`, "POST", { blocked: true })));
-      setSaveMsg(`Suppressed ${ids.length} contacts.`);
+      const response = await api<{ status: string; suppressed_count?: number }>("/contacts/bulk-suppress", "POST", {
+        selection,
+        queryHash: selection.mode === "all_matching_query" ? selection.queryHash : appliedQueryHash,
+        querySnapshotId: selection.mode === "all_matching_query" ? selection.querySnapshotId : undefined,
+        query: currentQueryForSelection,
+      });
+      setSaveMsg(`Suppressed ${response.suppressed_count || 0} contacts.`);
       await load();
     } catch (e) {
       setSaveMsg((e as Error).message);
@@ -1962,11 +2596,17 @@ function ContactsCrmPage() {
   };
 
   const bulkExport = async () => {
-    const selected = filteredRows.filter((r) => selectedIds.has(r.id));
-    if (!selected.length) return;
+    if (selection.mode === "explicit" && selection.ids.length === 0) return;
     setSaveMsg("Starting export job...");
     try {
-      const created = await api<{ job_id: string }>("/contacts/export-jobs", "POST", { contact_ids: selected.map((r) => r.id) });
+      const created = await api<{ job_id: string }>("/contacts/export-jobs", "POST", {
+        resource: "contacts",
+        columns: ["name", "phone_e164", "opt_in_status"],
+        selection,
+        queryHash: selection.mode === "all_matching_query" ? selection.queryHash : appliedQueryHash,
+        querySnapshotId: selection.mode === "all_matching_query" ? selection.querySnapshotId : undefined,
+        query: currentQueryForSelection,
+      });
       let status = await api<{ status: string; progress?: number; download_url?: string; rows?: number }>(`/contacts/export-jobs/${created.job_id}`);
       for (let i = 0; i < 12 && status.status !== "completed"; i += 1) {
         await new Promise((resolve) => setTimeout(resolve, 700));
@@ -1974,7 +2614,7 @@ function ContactsCrmPage() {
       }
       if (status.status === "completed" && status.download_url) {
         window.open(`${API_ORIGIN}${status.download_url}`, "_blank");
-        setSaveMsg(`Export ready. Rows: ${status.rows || selected.length}`);
+        setSaveMsg(`Export ready. Rows: ${status.rows || 0}`);
       } else {
         setSaveMsg(`Export still processing (status: ${status.status}).`);
       }
@@ -1984,7 +2624,7 @@ function ContactsCrmPage() {
   };
 
   const bulkCreateCampaign = async () => {
-    const selected = filteredRows.filter((r) => selectedIds.has(r.id));
+    const selected = filteredRows.filter((r) => isRowSelected(r.id));
     if (!selected.length) return;
     setSaveMsg("Creating campaign draft...");
     try {
@@ -2007,7 +2647,7 @@ function ContactsCrmPage() {
   };
 
   const bulkCreateSegment = async () => {
-    const selected = filteredRows.filter((r) => selectedIds.has(r.id));
+    const selected = filteredRows.filter((r) => isRowSelected(r.id));
     if (!selected.length) return;
     setSaveMsg("Creating segment from selected contacts...");
     try {
@@ -2067,6 +2707,8 @@ function ContactsCrmPage() {
       </div>
       <div className="campaign-actions">
         <input placeholder="tag for bulk add/remove" value={bulkTagValue} onChange={(e) => setBulkTagValue(e.target.value)} />
+        <button onClick={() => selectAllMatchingQuery().catch(console.error)} disabled={!appliedQueryHash}>Select all matching query</button>
+        <button onClick={clearSelection}>Clear selection</button>
         <button onClick={() => bulkAddTag().catch(console.error)}>Add tag</button>
         <button onClick={() => bulkRemoveTag().catch(console.error)}>Remove tag</button>
         <button onClick={() => bulkExport().catch(console.error)}>Export</button>
@@ -2077,12 +2719,15 @@ function ContactsCrmPage() {
       <div className="crm-layout">
         <div>
           <h3>Contact List</h3>
-          <DataTable
+          <RemoteDataTable
             columns={contactColumns}
             rows={filteredRows}
             rowKey={(r) => r.id}
-            selectedIds={selectedIds}
-            enableColumnVisibility
+            loading={false}
+            selectedIds={selectedIdsSet}
+            selection={selection}
+            visibleSelectedCount={selectedIdsSet.size}
+            totalApprox={totalApprox}
             storageKey="contacts_table"
             pageSize={pageSize}
             onPageSizeChange={(size) => {
@@ -2092,10 +2737,11 @@ function ContactsCrmPage() {
               setPrevCursors([]);
               setTimeout(() => { load("").catch(console.error); }, 0);
             }}
-            virtualizedHeight={380}
             onToggleRow={toggleSelect}
-            onToggleAll={toggleSelectAllVisible}
-            allVisibleSelected={filteredRows.length > 0 && filteredRows.every((r) => selectedIds.has(r.id))}
+            onToggleAllVisible={toggleSelectAllVisible}
+            onSelectAllMatching={selectAllMatchingQuery}
+            onClearSelection={clearSelection}
+            allVisibleSelected={filteredRows.length > 0 && filteredRows.every((r) => isRowSelected(r.id))}
             sortBy={sortBy}
             sortDir={sortDir}
             onSort={(key) => {
@@ -2110,28 +2756,29 @@ function ContactsCrmPage() {
               setPrevCursors([]);
               setTimeout(() => { load("").catch(console.error); }, 0);
             }}
-          />
-          <div className="campaign-actions">
-            <button
-              disabled={prevCursors.length === 0}
-              onClick={() => {
-                const prev = prevCursors[prevCursors.length - 1] || "";
-                setPrevCursors((arr) => arr.slice(0, -1));
-                load(prev).catch(console.error);
-              }}
-            >
-              Previous Page
-            </button>
-            <button
-              disabled={!nextCursor}
-              onClick={() => {
-                setPrevCursors((arr) => [...arr, cursor || ""]);
-                load(nextCursor).catch(console.error);
-              }}
-            >
-              Next Page
-            </button>
-          </div>
+          >
+            <div className="campaign-actions">
+              <button
+                disabled={prevCursors.length === 0}
+                onClick={() => {
+                  const prev = prevCursors[prevCursors.length - 1] || "";
+                  setPrevCursors((arr) => arr.slice(0, -1));
+                  load(prev).catch(console.error);
+                }}
+              >
+                Previous Page
+              </button>
+              <button
+                disabled={!nextCursor}
+                onClick={() => {
+                  setPrevCursors((arr) => [...arr, cursor || ""]);
+                  load(nextCursor).catch(console.error);
+                }}
+              >
+                Next Page
+              </button>
+            </div>
+          </RemoteDataTable>
         </div>
         <div>
           <h3>Contact Record</h3>
@@ -2184,6 +2831,117 @@ function ContactsCrmPage() {
   );
 }
 
+
+function ContactsCommandCenterPage() {
+  const nav = useNavigate();
+  const [rows, setRows] = useState<ContactCRMRecord[]>([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [search, setSearch] = useState("");
+  const [tag, setTag] = useState("");
+  const [optInStatus, setOptInStatus] = useState("");
+  const [suppressed, setSuppressed] = useState("");
+  const [contactFilter, setContactFilter] = useState("All");
+  const [bulkTagValue, setBulkTagValue] = useState("");
+  const [record, setRecord] = useState<ContactCRMRecord | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editEmail, setEditEmail] = useState("");
+  const [editTags, setEditTags] = useState("");
+  const [editOptIn, setEditOptIn] = useState("unknown");
+  const [saveMsg, setSaveMsg] = useState("");
+
+  const load = async () => {
+    const query: QueryState = {
+      limit: 100,
+      sortBy: "updated_at",
+      sortDir: "desc",
+      search,
+      filters: {
+        tag,
+        opt_in_status: optInStatus,
+        suppressed: suppressed === "yes" ? true : suppressed === "no" ? false : undefined,
+      },
+    };
+    const data = normalizeQueryPage<ContactCRMRecord>(await api<unknown>(`/contacts/crm/records?${toQueryString(query)}`));
+    setRows(data.items);
+    if (data.items.length && !selectedId) setSelectedId(data.items[0].id);
+  };
+
+  useEffect(() => { load().catch(console.error); }, []);
+  useEffect(() => {
+    if (!selectedId) return;
+    api<ContactCRMRecord>(`/contacts/${selectedId}/record`).then(setRecord).catch(console.error);
+  }, [selectedId]);
+  useEffect(() => {
+    if (!record) return;
+    setEditName(record.name || "");
+    setEditEmail(record.email || "");
+    setEditTags((record.tags || []).join(", "));
+    setEditOptIn(record.opt_in_status || "unknown");
+  }, [record]);
+
+  const filteredRows = useMemo(() => {
+    const now = Date.now();
+    return rows.filter((r) => {
+      const tagsLower = (r.tags || []).map((t) => String(t).toLowerCase());
+      const purchased = Boolean(r.last_order_at);
+      const recentlyActive = Boolean(r.last_inbound_at && new Date(r.last_inbound_at).getTime() >= now - 7 * 24 * 60 * 60 * 1000);
+      if (contactFilter === "All") return true;
+      if (contactFilter === "Opted in") return r.opt_in_status === "opted_in";
+      if (contactFilter === "Opted out") return ["opted_out", "unsubscribed"].includes(r.opt_in_status);
+      if (contactFilter === "Never messaged") return !r.last_message_at;
+      if (contactFilter === "Recently active") return recentlyActive;
+      if (contactFilter === "VIP") return tagsLower.includes("vip") || purchased;
+      if (contactFilter === "Cold audience") return !recentlyActive && !purchased && !r.last_reply_at;
+      if (contactFilter === "Clicked campaign") return Boolean(r.last_click_at);
+      if (contactFilter === "Replied to campaign") return Boolean(r.last_reply_at);
+      if (contactFilter === "Purchased") return purchased;
+      if (contactFilter === "Abandoned cart") return tagsLower.includes("abandoned_cart") || tagsLower.includes("cart");
+      return true;
+    });
+  }, [rows, contactFilter]);
+
+  const initials = (name?: string | null) => (name || "Unknown").trim().split(/\s+/).slice(0, 2).map((p) => p[0]?.toUpperCase() || "").join("") || "UN";
+  const rel = (value?: string | null) => {
+    if (!value) return "-";
+    const mins = Math.max(1, Math.round((Date.now() - new Date(value).getTime()) / 60000));
+    if (mins < 60) return `${mins}m ago`;
+    const hrs = Math.round(mins / 60);
+    if (hrs < 24) return `${hrs}h ago`;
+    return `${Math.round(hrs / 24)}d ago`;
+  };
+  const optInCount = rows.filter((r) => r.opt_in_status === "opted_in").length;
+  const optOutCount = rows.filter((r) => ["opted_out", "unsubscribed"].includes(r.opt_in_status)).length;
+  const unknownCount = Math.max(0, rows.length - optInCount - optOutCount);
+  const selected = record || rows.find((r) => r.id === selectedId) || null;
+
+  const saveContact = async () => {
+    if (!selectedId) return;
+    setSaveMsg("Saving contact...");
+    try {
+      await api(`/contacts/${selectedId}`, "PATCH", { name: editName, email: editEmail, tags: editTags.split(",").map((t) => t.trim()).filter(Boolean) });
+      await api(`/contacts/${selectedId}/opt-in`, "POST", { opt_in_status: editOptIn, opt_in_source: "crm_manual" });
+      setSaveMsg("Contact saved.");
+      await load();
+    } catch (e) { setSaveMsg((e as Error).message); }
+  };
+
+  return (
+    <div className="contacts-replica">
+      <h2 className="sr-only">Merchant Command Center - Contacts page with search filters, segment chips, bulk actions, contact list table, and contact record form</h2>
+      <div className="shell">
+        <aside className="sidebar"><div className="sidebar-top"><div className="sidebar-brand">Command Center</div><div className="sidebar-sub">WhatsApp Business Platform</div></div><div className="nav-group"><div className="nav-label">Main</div><div className="nav-item" onClick={() => nav('/dashboard')}>Dashboard</div><div className="nav-item" onClick={() => nav('/inbox')}>Inbox</div><div className="nav-item active">Contacts</div><div className="nav-item" onClick={() => nav('/campaigns')}>Campaigns</div><div className="nav-item" onClick={() => nav('/templates')}>Templates</div></div><div className="nav-group"><div className="nav-label">Tools</div><div className="nav-item" onClick={() => nav('/automations')}>Automations</div><div className="nav-item" onClick={() => nav('/commerce')}>Commerce</div><div className="nav-item" onClick={() => nav('/analytics')}>Analytics</div><div className="nav-item" onClick={() => nav('/billing')}>Billing</div></div><div className="nav-group"><div className="nav-label">Account</div><div className="nav-item" onClick={() => nav('/settings')}>Settings</div><div className="nav-item" onClick={() => nav('/admin-support')}>Admin / Support</div></div><div className="sidebar-footer"><div className="biz-name">Test Business</div><div className="biz-info">WABA: Default<br />Range: Last 7 days</div></div></aside>
+        <main className="main"><div className="topbar"><div className="topbar-crumb">Command Center › <span>Contacts</span></div><div className="topbar-meta"><div className="meta-chip">Test Business</div><div className="meta-chip">WABA: Default</div><div className="meta-chip">Last 7 days</div><button className="btn-logout" onClick={() => { clearAuthStorage(); nav('/login', { replace: true }); }}>Logout</button></div></div>
+          <div className="page-header"><div><div className="page-title">Contacts</div><div className="page-subtitle">Search, segment, and manage your WhatsApp contacts</div></div><div className="stat-row"><div className="stat-box"><div className="stat-num">{rows.length}</div><div className="stat-lbl">Total</div></div><div className="stat-box"><div className="stat-num green">{optInCount}</div><div className="stat-lbl">Opted in</div></div><div className="stat-box"><div className="stat-num red">{optOutCount}</div><div className="stat-lbl">Opted out</div></div><div className="stat-box"><div className="stat-num amber">{unknownCount}</div><div className="stat-lbl">Unknown</div></div></div></div>
+          <div className="body"><section className="contacts-panel"><div className="filter-card"><div className="filter-row"><input className="filter-input" placeholder="Search name / email / phone / wa_id..." value={search} onChange={(e) => setSearch(e.target.value)} /><input className="filter-input narrow" placeholder="Filter tag..." value={tag} onChange={(e) => setTag(e.target.value)} /></div><div className="filter-row"><input className="filter-input" placeholder="opt_in_status (opted_in / opted_out / unknown)..." value={optInStatus} onChange={(e) => setOptInStatus(e.target.value)} /><select className="filter-select" value={suppressed} onChange={(e) => setSuppressed(e.target.value)}><option value="">Suppression: any</option><option value="yes">Suppressed</option><option value="no">Not suppressed</option></select></div><button className="btn-search" onClick={() => load().catch(console.error)}>Search Contacts</button><div className="segment-row">{["All", "Opted in", "Opted out", "Never messaged", "Recently active", "VIP", "Cold audience", "Clicked campaign", "Replied to campaign", "Purchased", "Abandoned cart"].map((f) => <button key={f} className={`seg-chip ${contactFilter === f ? 'active' : ''}`} onClick={() => setContactFilter(f)}>{f}</button>)}</div></div>
+            <div className="actions-row"><input className="action-tag-input" placeholder="tag for bulk add/remove..." value={bulkTagValue} onChange={(e) => setBulkTagValue(e.target.value)} /><button className="act-btn">Select all matching</button><button className="act-btn">Clear selection</button><button className="act-btn green">Add tag</button><button className="act-btn red">Remove tag</button><button className="act-btn">Export</button><button className="act-btn red">Suppress</button><button className="act-btn blue">Create campaign</button><button className="act-btn teal">Create segment</button></div>
+            <div className="table-section"><div className="table-topbar"><div className="table-topbar-title">Contact list <span>{filteredRows.length} results</span></div><select className="page-select"><option>100 / page</option><option>50 / page</option><option>25 / page</option></select><div className="col-toggles">{["Name", "Phone", "Tags", "Opt-in", "Last msg", "Last campaign", "Last order"].map((c) => <label key={c} className="col-toggle"><input type="checkbox" defaultChecked /> <span>{c}</span></label>)}</div></div><table><thead><tr><th><input type="checkbox" /></th><th>Name</th><th>Phone</th><th>Tags</th><th>Opt-in status</th><th>Last message</th><th>Last campaign</th><th>Last order</th></tr></thead><tbody>{filteredRows.map((r) => <tr key={r.id} className={selectedId === r.id ? "selected" : ""} onClick={() => setSelectedId(r.id)}><td><input type="checkbox" /></td><td><div className="name-cell"><div className="c-avatar">{initials(r.name)}</div>{r.name || "Unknown"}</div></td><td>{r.phone_e164 || r.wa_id || "-"}</td><td>{(r.tags || []).slice(0, 2).map((t) => <span key={t} className="tag-pill">{t}</span>)}</td><td><span className={`optin-pill ${r.opt_in_status === 'opted_in' ? 'ok' : r.opt_in_status === 'unknown' ? 'warn' : 'bad'}`}>{r.opt_in_status || "unknown"}</span></td><td>{rel(r.last_message_at)}</td><td>{rel(r.last_campaign_at)}</td><td>{r.last_order_at ? rel(r.last_order_at) : "-"}</td></tr>)}</tbody></table></div></section>
+            <aside className="right-panel"><div className="rp-header"><div className="rp-title">Contact record</div><div className="rp-sub">Create or edit the selected contact</div></div><div className="rp-body"><div className="stat-row"><div className="stat-box"><div className="stat-num">{selected?.tags?.length || 0}</div><div className="stat-lbl">Tags</div></div><div className="stat-box"><div className="stat-num">{selected?.last_message_at ? '1' : '0'}</div><div className="stat-lbl">Threads</div></div></div><label className="form-field"><span className="form-label">Name</span><input className="form-input" value={editName} onChange={(e) => setEditName(e.target.value)} /></label><label className="form-field"><span className="form-label">Phone</span><input className="form-input" value={selected?.phone_e164 || ''} readOnly /></label><label className="form-field"><span className="form-label">Email</span><input className="form-input" value={editEmail} onChange={(e) => setEditEmail(e.target.value)} /></label><label className="form-field"><span className="form-label">Tags</span><input className="form-input" value={editTags} onChange={(e) => setEditTags(e.target.value)} /></label><label className="form-field"><span className="form-label">Opt-in status</span><select className="form-input" value={editOptIn} onChange={(e) => setEditOptIn(e.target.value)}><option value="opted_in">opted_in</option><option value="opted_out">opted_out</option><option value="unsubscribed">unsubscribed</option><option value="unknown">unknown</option></select></label>{saveMsg && <div className="save-msg">{saveMsg}</div>}</div><div className="rp-footer"><button className="btn-full primary" onClick={() => saveContact().catch(console.error)}>Save Contact</button><button className="btn-full">Open Detail</button><button className="btn-full danger">Suppress Contact</button></div></aside>
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
 function ContactDetailPage() {
   const { id } = useParams();
   const contactId = id!;
@@ -2337,18 +3095,20 @@ export default function App() {
     <Routes>
       <Route path="/" element={<Navigate to="/dashboard" replace />} />
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/settings/whatsapp-setup" element={<WhatsAppSetupPage />} />
+      <Route path="/embedded-signup" element={<WhatsAppSetupPage />} />
+      <Route path="/embedded-signup/next" element={<EmbeddedSignupNextPage />} />
       <Route element={<RequireAuth><CommandCenterLayout /></RequireAuth>}>
         <Route path="/dashboard" element={<DashboardPage />} />
-        <Route path="/inbox" element={<InboxPage />} />
-        <Route path="/contacts" element={<ContactsCrmPage />} />
+        <Route path="/inbox" element={<InboxReplicaPage />} />
+        <Route path="/contacts" element={<ContactsCommandCenterPage />} />
         <Route path="/contacts/:id" element={<ContactDetailPage />} />
-        <Route path="/templates" element={<PlaceholderPage title="Templates" subtitle="Template library, approval status, and quality indicators." />} />
+        <Route path="/templates" element={<TemplateApprovalPage />} />
         <Route path="/automations" element={<PlaceholderPage title="Automations" subtitle="Flows, triggers, and journey controls." />} />
         <Route path="/commerce" element={<PlaceholderPage title="Commerce" subtitle="Orders, carts, click-through and conversion actions." />} />
-        <Route path="/analytics" element={<PlaceholderPage title="Analytics" subtitle="Funnel, cohort, message, and revenue analytics." />} />
-        <Route path="/billing" element={<PlaceholderPage title="Billing" subtitle="Usage, wallet, ledger, and invoicing controls." />} />
+        <Route path="/analytics" element={<DashboardPage />} />
+        <Route path="/billing" element={<RevenuePage />} />
         <Route path="/settings" element={<SettingsPage />} />
-        <Route path="/settings/whatsapp-setup" element={<WhatsAppSetupPage />} />
         <Route path="/admin-support" element={<PlaceholderPage title="Admin / Support" subtitle="Audit trails, diagnostics, runbooks, and support tools." />} />
 
         <Route path="/campaigns" element={<CampaignListPage />} />
@@ -2369,6 +3129,17 @@ export default function App() {
     </Routes>
   );
 }
+
+
+
+
+
+
+
+
+
+
+
 
 
 

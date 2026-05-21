@@ -1,4 +1,4 @@
-import { ReactNode, useMemo, useState } from "react";
+import React, { ReactNode, UIEvent, useCallback, useMemo, useRef, useState } from "react";
 
 export type DataTableColumn<T> = {
   key: string;
@@ -6,9 +6,10 @@ export type DataTableColumn<T> = {
   sortable?: boolean;
   width?: string;
   render: (row: T) => ReactNode;
+  exportValue?: (row: T) => string | number | boolean | null | undefined;
 };
 
-type DataTableProps<T extends { id?: string }> = {
+type DataTableProps<T> = {
   columns: DataTableColumn<T>[];
   rows: T[];
   loading?: boolean;
@@ -27,9 +28,29 @@ type DataTableProps<T extends { id?: string }> = {
   storageKey?: string;
   pageSize?: number;
   onPageSizeChange?: (size: number) => void;
+  storageVersion?: number;
 };
 
-export function DataTable<T extends { id?: string }>(props: DataTableProps<T>) {
+function CellErrorFallback({ message }: { message: string }) {
+  return <span title={message}>[render error]</span>;
+}
+
+// Keep boundary local to avoid crashing the entire table from one bad renderer.
+class RenderErrorBoundary extends React.Component<{ children: ReactNode }, { hasError: boolean; message: string }> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, message: "" };
+  }
+  static getDerivedStateFromError(error: unknown) {
+    return { hasError: true, message: error instanceof Error ? error.message : "unknown error" };
+  }
+  render() {
+    if (this.state.hasError) return <CellErrorFallback message={this.state.message} />;
+    return this.props.children;
+  }
+}
+
+export function DataTable<T>(props: DataTableProps<T>) {
   const {
     columns,
     rows,
@@ -49,18 +70,34 @@ export function DataTable<T extends { id?: string }>(props: DataTableProps<T>) {
     storageKey,
     pageSize,
     onPageSizeChange,
+    storageVersion = 1,
   } = props;
+  if (typeof window !== "undefined" && import.meta.env.DEV) {
+    const seen = new Set<string>();
+    for (const c of columns) {
+      if (seen.has(c.key)) {
+        throw new Error(`Duplicate DataTable column key detected: "${c.key}"`);
+      }
+      seen.add(c.key);
+    }
+  }
   const [hidden, setHidden] = useState<Set<string>>(() => {
+    if (typeof window === "undefined") return new Set();
     if (!storageKey) return new Set();
     try {
       const raw = localStorage.getItem(`${storageKey}:hidden_columns`);
-      const parsed = raw ? (JSON.parse(raw) as string[]) : [];
+      const parsedPayload = raw ? (JSON.parse(raw) as { version?: number; hiddenColumns?: string[] } | string[]) : [];
+      const parsed = Array.isArray(parsedPayload)
+        ? parsedPayload
+        : (parsedPayload.version === storageVersion ? (parsedPayload.hiddenColumns || []) : []);
       return new Set(parsed);
     } catch {
       return new Set();
     }
   });
   const [scrollTop, setScrollTop] = useState(0);
+  const scrollFrameRef = useRef<number | null>(null);
+  const latestScrollTopRef = useRef(0);
   const visibleColumns = useMemo(() => columns.filter((c) => !hidden.has(c.key)), [columns, hidden]);
   const canVirtualize = rows.length > 100;
   const startIndex = canVirtualize ? Math.max(0, Math.floor(scrollTop / virtualizedRowHeight) - 5) : 0;
@@ -76,9 +113,9 @@ export function DataTable<T extends { id?: string }>(props: DataTableProps<T>) {
     const header = visibleColumns.map((c) => c.title);
     const lines = selectedRows.map((row) =>
       visibleColumns.map((c) => {
-        const value = c.render(row);
-        const text = typeof value === "string" || typeof value === "number" ? String(value) : "";
-        return `"${text.replaceAll("\"", "\"\"")}"`;
+        const value = c.exportValue ? c.exportValue(row) : c.render(row);
+        const text = typeof value === "string" || typeof value === "number" || typeof value === "boolean" ? String(value) : "";
+        return `"${text.replace(/"/g, "\"\"")}"`;
       }).join(",")
     );
     const csv = [header.join(","), ...lines].join("\n");
@@ -95,10 +132,42 @@ export function DataTable<T extends { id?: string }>(props: DataTableProps<T>) {
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
-      if (storageKey) localStorage.setItem(`${storageKey}:hidden_columns`, JSON.stringify(Array.from(next)));
+      if (storageKey) {
+        localStorage.setItem(
+          `${storageKey}:hidden_columns`,
+          JSON.stringify({ version: storageVersion, hiddenColumns: Array.from(next) })
+        );
+      }
       return next;
     });
   };
+  const onScroll = useCallback((e: UIEvent<HTMLDivElement>) => {
+    latestScrollTopRef.current = e.currentTarget.scrollTop;
+    if (scrollFrameRef.current != null) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      setScrollTop(latestScrollTopRef.current);
+    });
+  }, []);
+  const renderedRows = useMemo(
+    () =>
+      displayRows.map((row) => {
+        const id = rowKey(row);
+        return (
+          <tr key={id} role="row">
+            {onToggleRow ? (
+              <td><input type="checkbox" checked={!!selectedIds?.has(id)} onChange={() => onToggleRow(id)} /></td>
+            ) : null}
+            {visibleColumns.map((c) => (
+              <td key={`${id}:${c.key}`} role="cell">
+                <RenderErrorBoundary>{c.render(row)}</RenderErrorBoundary>
+              </td>
+            ))}
+          </tr>
+        );
+      }),
+    [displayRows, onToggleRow, rowKey, selectedIds, visibleColumns]
+  );
 
   return (
     <div>
@@ -126,13 +195,18 @@ export function DataTable<T extends { id?: string }>(props: DataTableProps<T>) {
           <button type="button" onClick={exportSelected}>Export Selected</button>
         </div>
       ) : null}
-      <div style={{ maxHeight: virtualizedHeight, overflow: "auto" }} onScroll={(e) => setScrollTop((e.target as HTMLDivElement).scrollTop)}>
-    <table>
+      <div style={{ maxHeight: virtualizedHeight, overflow: "auto" }} onScroll={onScroll}>
+    <table role="table" aria-rowcount={rows.length}>
       <thead>
-        <tr>
+        <tr role="row">
           {onToggleAll ? <th><input type="checkbox" checked={!!allVisibleSelected} onChange={onToggleAll} /></th> : null}
           {visibleColumns.map((c) => (
-            <th key={c.key} style={c.width ? { width: c.width } : undefined}>
+            <th
+              key={c.key}
+              role="columnheader"
+              aria-sort={sortBy === c.key ? (sortDir === "asc" ? "ascending" : "descending") : "none"}
+              style={c.width ? { width: c.width } : undefined}
+            >
               {c.sortable && onSort ? (
                 <button type="button" onClick={() => onSort(c.key)}>
                   {c.title}{sortBy === c.key ? (sortDir === "asc" ? " ↑" : " ↓") : ""}
@@ -148,17 +222,7 @@ export function DataTable<T extends { id?: string }>(props: DataTableProps<T>) {
           <tr><td colSpan={visibleColumns.length + (onToggleAll ? 1 : 0)}>Loading...</td></tr>
         ) : rows.length === 0 ? (
           <tr><td colSpan={visibleColumns.length + (onToggleAll ? 1 : 0)}>No records</td></tr>
-        ) : displayRows.map((row) => {
-          const id = rowKey(row);
-          return (
-            <tr key={id}>
-              {onToggleRow ? (
-                <td><input type="checkbox" checked={!!selectedIds?.has(id)} onChange={() => onToggleRow(id)} /></td>
-              ) : null}
-              {visibleColumns.map((c) => <td key={`${id}:${c.key}`}>{c.render(row)}</td>)}
-            </tr>
-          );
-        })}
+        ) : renderedRows}
         {bottomSpacer > 0 ? <tr><td colSpan={visibleColumns.length + (onToggleAll ? 1 : 0)} style={{ height: `${bottomSpacer}px`, padding: 0, border: "none" }} /></tr> : null}
       </tbody>
     </table>

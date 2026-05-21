@@ -82,3 +82,17 @@ class WebhookEventStatus(str, enum.Enum):
     PROCESSING = "processing"
     PROCESSED = "processed"
     FAILED = "failed"
+
+
+class WhatsAppIntegrationStatus(str, enum.Enum):
+    DISCONNECTED = "disconnected"
+    PROVISIONING = "provisioning"
+    CONNECTED = "connected"
+    RECONNECT_REQUIRED = "reconnect_required"
+    DISCONNECTING = "disconnecting"
+
+
+class OnboardingOperationStatus(str, enum.Enum):
+    PENDING = "pending"
+    COMPLETED = "completed"
+    FAILED = "failed"
