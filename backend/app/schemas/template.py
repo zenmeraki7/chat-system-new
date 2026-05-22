@@ -15,12 +15,6 @@ class TemplateCreateRequest(BaseModel):
     rejection_reason: str | None = Field(default=None, max_length=2000)
 
 
-class TemplateStatusUpdateRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    status: str = Field(min_length=1, max_length=30)
-    rejection_reason: str | None = Field(default=None, max_length=2000)
-
-
 class TemplateResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: uuid.UUID

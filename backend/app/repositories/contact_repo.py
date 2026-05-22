@@ -1,10 +1,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from typing import Optional, Sequence
 from uuid import UUID
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from app.filters.contact_filters import CONTACT_FILTERS
 from app.models.business_domains import Contact, ContactMergeEvent, ContactSource
+from app.services.filter_compiler import FilterCompiler
+from app.sorting.contact_sorts import CONTACT_SORTS
+from app.utils.cursor_conditions import build_cursor_condition
+from app.utils.search import normalize_search
+from app.utils.sorting import build_order_by, resolve_sort, ResolvedSort
 
 
 class ContactRepository:
@@ -16,6 +23,145 @@ class ContactRepository:
             select(Contact).where(Contact.business_id == business_id, Contact.deleted_at.is_(None)).order_by(Contact.updated_at.desc()).limit(limit)
         )
         return list(res.scalars().all())
+
+    async def list_contacts_cursor(
+        self,
+        *,
+        business_id: UUID,
+        limit: int,
+        sort_key: Optional[str],
+        sort_dir: Optional[str],
+        cursor_sort_value: Optional[object] = None,
+        cursor_id: Optional[UUID] = None,
+        search: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> tuple[Sequence[Contact], ResolvedSort]:
+        resolved_sort = resolve_sort(
+            sort_key=sort_key,
+            sort_dir=sort_dir,
+            sort_registry=CONTACT_SORTS,
+            default_sort_key="updated_at",
+        )
+
+        conditions = [
+            Contact.business_id == business_id,
+            Contact.deleted_at.is_(None),
+        ]
+
+        if status:
+            conditions.append(Contact.status == status)
+
+        if search:
+            normalized = f"%{search.strip()}%"
+            conditions.append(
+                or_(
+                    Contact.display_name.ilike(normalized),
+                    Contact.normalized_phone.ilike(normalized),
+                )
+            )
+
+        cursor_condition = build_cursor_condition(
+            sort_column=resolved_sort.column,
+            id_column=Contact.id,
+            sort_dir=resolved_sort.dir,
+            cursor_sort_value=cursor_sort_value,
+            cursor_id=cursor_id,
+        )
+        if cursor_condition is not None:
+            conditions.append(cursor_condition)
+
+        order_by = build_order_by(resolved_sort, Contact.id)
+
+        stmt = (
+            select(Contact)
+            .where(*conditions)
+            .order_by(*order_by)
+            .limit(limit + 1)
+        )
+
+        result = await self.db.execute(stmt)
+        return result.scalars().all(), resolved_sort
+
+    async def search_contacts(
+        self,
+        *,
+        business_id: UUID,
+        limit: int,
+        search: str | None,
+        filter_group,
+        sort_key: str,
+        sort_dir: str,
+        cursor_sort_value=None,
+        cursor_id: UUID | None = None,
+    ) -> tuple[Sequence[Contact], ResolvedSort, int]:
+        resolved_sort = resolve_sort(
+            sort_key=sort_key,
+            sort_dir=sort_dir,
+            sort_registry=CONTACT_SORTS,
+            default_sort_key="updated_at",
+        )
+        conditions = [
+            Contact.business_id == business_id,
+            Contact.deleted_at.is_(None),
+        ]
+
+        normalized = normalize_search(search)
+        if normalized:
+            like = f"%{normalized}%"
+            conditions.append(
+                or_(
+                    Contact.display_name.ilike(like),
+                    Contact.normalized_phone.ilike(like),
+                    Contact.email.ilike(like),
+                )
+            )
+
+        filter_condition = FilterCompiler(CONTACT_FILTERS).compile(filter_group)
+        if filter_condition is not None:
+            conditions.append(filter_condition)
+
+        base_stmt = select(Contact).where(*conditions)
+        is_broad_query = self._is_broad_query(
+            normalized_search=normalized,
+            filter_group=filter_group,
+        )
+        total_estimate = await self._bounded_total_estimate(
+            base_stmt=base_stmt,
+            estimate_cap=(2000 if is_broad_query else 10000),
+        )
+
+        cursor_condition = build_cursor_condition(
+            sort_column=resolved_sort.column,
+            id_column=Contact.id,
+            sort_dir=resolved_sort.dir,
+            cursor_sort_value=cursor_sort_value,
+            cursor_id=cursor_id,
+        )
+        stmt = base_stmt
+        if cursor_condition is not None:
+            stmt = stmt.where(cursor_condition)
+
+        stmt = (
+            stmt
+            .order_by(*build_order_by(resolved_sort, Contact.id))
+            .limit(limit + 1)
+        )
+        result = await self.db.execute(stmt)
+        return result.scalars().all(), resolved_sort, total_estimate
+
+    async def _bounded_total_estimate(self, *, base_stmt, estimate_cap: int) -> int:
+        # Estimate cardinality without an exact COUNT(*) on large filtered subqueries.
+        estimate_ids_stmt = base_stmt.with_only_columns(Contact.id).limit(estimate_cap + 1)
+        estimate_rows = (await self.db.execute(estimate_ids_stmt)).all()
+        if len(estimate_rows) > estimate_cap:
+            return estimate_cap
+        return len(estimate_rows)
+
+    def _is_broad_query(self, *, normalized_search: str | None, filter_group) -> bool:
+        if normalized_search:
+            return False
+        filters = getattr(filter_group, "filters", None) or []
+        return len(filters) == 0
 
     async def get_by_id_for_business(self, business_id: UUID, contact_id: UUID):
         res = await self.db.execute(
@@ -127,4 +273,3 @@ class ContactRepository:
         )
         await self.db.flush()
         return target
-

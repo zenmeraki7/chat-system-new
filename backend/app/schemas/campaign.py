@@ -70,7 +70,10 @@ class CampaignFinalizeResponse(BaseModel):
     total_recipients: int
     eligible_recipients: int
     skipped_recipients: int
-    validation_errors: list[dict] = []
+    validation_errors: list[dict] = Field(default_factory=list)
+    freeze_version: int | None = None
+    freeze_batch_id: str | None = None
+    validation_summary_snapshot: dict | None = None
 
 
 class CampaignTemplateVariableMappingRequest(BaseModel):

@@ -33,6 +33,16 @@ class ContactResponse(BaseModel):
     marketing_eligible: bool
 
 
+class ContactListResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: uuid.UUID
+    name: str | None = None
+    phone_number: str
+    status: str
+    created_at: datetime
+    updated_at: datetime
+
+
 class ContactCSVValidationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     csv_text: str
@@ -61,6 +71,43 @@ class ContactUpdateRequest(BaseModel):
     email: str | None = None
     tags: list[str] | None = None
     custom_attributes: dict | None = None
+
+
+class ContactAgentCaptureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    event_type: str = Field(
+        pattern="^(add_tag|add_purchase|add_enquiry|add_follow_up|add_note|mark_hot_lead|mark_existing_customer|mark_walk_in_customer|mark_converted)$"
+    )
+    tag: str | None = Field(default=None, min_length=1, max_length=40)
+    purchased_item: str | None = Field(default=None, min_length=1, max_length=180)
+    amount: float | None = Field(default=None, ge=0, le=1000000000)
+    next_follow_up: str | None = Field(default=None, min_length=1, max_length=250)
+    note: str | None = Field(default=None, min_length=1, max_length=1000)
+    captured_at: datetime | None = None
+
+
+class ContactQrOptInCaptureRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    phone_e164: str = Field(min_length=7, max_length=25)
+    wa_id: str | None = Field(default=None, max_length=255)
+    name: str | None = Field(default=None, max_length=255)
+    branch: str = Field(min_length=1, max_length=120)
+    source: str = Field(default="in_store_qr", min_length=1, max_length=80)
+    prefilled_message: str = Field(default="JOIN", min_length=1, max_length=120)
+    tags: list[str] = Field(default_factory=lambda: ["walk_in_customer"])
+
+
+class ContactOfflineRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    phone_e164: str = Field(min_length=7, max_length=25)
+    name: str | None = Field(default=None, max_length=255)
+    branch: str = Field(min_length=1, max_length=120)
+    registration_type: str = Field(pattern="^(digital_bill|warranty|loyalty|exchange_policy|styling_tips|next_offer|service_appointment)$")
+    product_purchased: str | None = Field(default=None, max_length=180)
+    purchase_date: datetime | None = None
+    warranty_until: datetime | None = None
+    service_reminder_at: datetime | None = None
+    consent_reply: str = Field(pattern="^(YES|NO)$")
 
 
 class ContactSegmentFilter(BaseModel):
@@ -103,3 +150,34 @@ class ContactDuplicateSuggestionResponse(BaseModel):
     score: int
     reasons: list[str]
     safe_to_merge: bool
+
+
+class ContactExportJobCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    resource: str = Field(pattern="^contacts$")
+    columns: list[str] = Field(default_factory=list)
+    selection_mode: str = Field(pattern="^snapshot$")
+    query_snapshot_id: uuid.UUID
+    operation_id: str = Field(min_length=1, max_length=120)
+
+
+class ContactBulkSuppressPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    selection_mode: str = Field(pattern="^snapshot$")
+    query_snapshot_id: uuid.UUID
+    operation_id: str = Field(min_length=1, max_length=120)
+
+
+class ContactBulkSuppressConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operation_id: str = Field(min_length=1, max_length=120)
+    confirmation_hash: str = Field(min_length=16, max_length=128)
+
+
+class ContactBulkTagRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    operation_id: str = Field(min_length=1, max_length=120)
+    selection_mode: str = Field(pattern="^snapshot$")
+    query_snapshot_id: uuid.UUID
+    action: str = Field(pattern="^(add|remove)$")
+    tag: str = Field(min_length=1, max_length=80)

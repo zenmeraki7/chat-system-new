@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Header
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,10 +16,10 @@ from app.schemas.template import (
     TemplateSyncRequest,
     TemplateSyncResponse,
     TemplateSyncRunResponse,
-    TemplateStatusUpdateRequest,
     TemplateSummaryResponse,
 )
 from app.services.template_graph_sync_service import TemplateGraphSyncService
+from app.services.idempotency_service import IdempotencyService
 
 router = APIRouter(prefix="/templates", tags=["Templates"])
 
@@ -209,55 +209,30 @@ async def create_template(
     return _to_template_response(row)
 
 
-@router.patch("/{template_id}/status", response_model=TemplateResponse)
-async def update_template_status(
-    template_id: str,
-    payload: TemplateStatusUpdateRequest,
-    actor: CurrentActor = Depends(require_permissions("campaigns:write")),
-    db: AsyncSession = Depends(get_db),
-):
-    try:
-        template_uuid = UUID(template_id)
-    except ValueError as exc:
-        raise BadRequestException("Invalid template id") from exc
-
-    row = (
-        await db.execute(
-            select(WhatsAppMessageTemplate).where(
-                WhatsAppMessageTemplate.id == template_uuid,
-                WhatsAppMessageTemplate.business_id == actor.business.id,
-                WhatsAppMessageTemplate.deleted_at.is_(None),
-            ).with_for_update()
-        )
-    ).scalar_one_or_none()
-    if not row:
-        raise NotFoundException("Template not found")
-
-    normalized_status = payload.status.strip().lower()
-    if normalized_status not in {"draft", "pending", "in_review", "submitted", "approved", "active", "rejected", "paused", "disabled"}:
-        raise BadRequestException("Invalid template status")
-
-    row.status = normalized_status
-    row.rejection_reason = payload.rejection_reason.strip() if payload.rejection_reason else None
-    row.last_synced_at = datetime.now(timezone.utc)
-    await db.commit()
-    await db.refresh(row)
-    return _to_template_response(row)
-
-
 @router.post("/sync", response_model=TemplateSyncResponse)
 async def sync_templates_from_graph(
     payload: TemplateSyncRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     actor: CurrentActor = Depends(require_permissions("whatsapp:connect")),
     db: AsyncSession = Depends(get_db),
 ):
+    if not idempotency_key or not str(idempotency_key).strip():
+        raise BadRequestException("Idempotency-Key header is required")
+    key = idempotency_key.strip()
+    replay = await IdempotencyService(db).begin_or_replay(
+        actor.business.id,
+        key,
+        {"action": "templates_sync", "waba_id": payload.waba_id.strip() if payload.waba_id else None},
+    )
+    if replay is not None:
+        return TemplateSyncResponse(**replay)
     result = await TemplateGraphSyncService(db).sync_business_templates(
         business_id=actor.business.id,
         requested_by_user_id=actor.user.id,
         trigger="manual_endpoint",
         waba_id=(payload.waba_id.strip() if payload.waba_id else None),
     )
-    return TemplateSyncResponse(
+    response = TemplateSyncResponse(
         run_id=result.run_id,
         business_id=result.business_id,
         status=result.status,
@@ -268,6 +243,8 @@ async def sync_templates_from_graph(
         completed_at=result.completed_at,
         failure_reason=result.failure_reason,
     )
+    await IdempotencyService(db).finalize(actor.business.id, key, response.model_dump(mode="json"))
+    return response
 
 
 @router.get("/sync/runs", response_model=list[TemplateSyncRunResponse])

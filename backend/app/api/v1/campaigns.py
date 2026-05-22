@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentActor, require_permissions
 from app.core.exceptions import BadRequestException, NotFoundException
 from app.database import get_db
-from app.models.business_domains import Campaign, CampaignExecutionEvent, CampaignRecipient, CampaignRecipientEvent, CampaignSendJob, CampaignStatusEvent, JobOperation, MessageOutbox, WhatsAppMessageTemplate, WebhookEvent, BusinessDashboardStat, CampaignApprovalSnapshot
+from app.models.business_domains import Campaign, CampaignExecutionEvent, CampaignRecipient, CampaignRecipientEvent, CampaignSendJob, CampaignStatusEvent, JobOperation, MessageOutbox, OutboxEvent, WhatsAppMessageTemplate, WebhookEvent, BusinessDashboardStat, CampaignApprovalSnapshot, Contact
 from app.models.business import Business
 from app.models.business_domains import WhatsAppPhoneNumber, WhatsAppBusinessAccount, WhatsAppIntegration
 from app.schemas.campaign import (
@@ -36,14 +36,29 @@ from app.services.campaign_blackbox_recorder import CampaignBlackBoxRecorder
 from app.services.campaign_recipient_explainability_service import CampaignRecipientExplainabilityService
 from app.services.audience_warmth_service import AudienceWarmthService
 from app.services.campaign_health_service import CampaignHealthService
+from app.services.csv_safety import escape_csv_cell
 from app.services.object_storage_service import object_storage_service
 from app.services.table_registry import validate_table_query
 from app.services.query_cost_service import classify_table_query
 from app.services.data_freshness_service import freshness_live_db
+from app.utils.cursor import decode_cursor, encode_cursor, InvalidCursorError, stable_hash
 
 
 router = APIRouter(prefix="/campaigns", tags=["Campaigns"])
 LAUNCH_FRESHNESS_MAX_LAG_SECONDS = 900
+
+
+def _campaign_recipient_query_fingerprint(*, business_id: UUID, campaign_id: UUID, status: str | None, search: str | None, sort_by: str, sort_dir: str) -> str:
+    return stable_hash(
+        {
+            "resource": "campaign_recipients",
+            "businessId": str(business_id),
+            "campaignId": str(campaign_id),
+            "status": status or "",
+            "search": (search or "").strip().lower(),
+            "sort": {"key": sort_by, "dir": sort_dir},
+        }
+    )
 
 
 def _compute_campaign_recipient_snapshot_hash(rows: list[CampaignRecipient]) -> str:
@@ -423,20 +438,6 @@ async def delete_campaign(
     row.deleted_at = datetime.now(timezone.utc)
     await db.commit()
     return {"campaign_id": str(row.id), "deleted": True}
-
-
-@router.post("/{campaign_id}/finalize", response_model=CampaignFinalizeResponse)
-async def finalize_campaign(
-    campaign_id: str,
-    actor: CurrentActor = Depends(require_permissions("campaigns:write")),
-    db: AsyncSession = Depends(get_db),
-):
-    summary = await CampaignRecipientSourceService(db).finalize_and_freeze(
-        business_id=actor.business.id,
-        campaign_id=UUID(campaign_id),
-    )
-    await db.commit()
-    return CampaignFinalizeResponse(**summary)
 
 
 @router.post("/{campaign_id}/schedule", response_model=CampaignTransitionResponse)
@@ -1103,10 +1104,12 @@ async def list_campaign_recipients(
     cursor: str | None = Query(default=None),
     sort_by: str = Query(default="created_at"),
     sort_dir: str = Query(default="asc"),
+    request_query_fingerprint: str | None = Query(default=None, alias="queryFingerprint"),
     limit: int = Query(default=500, ge=1, le=5000),
     actor: CurrentActor = Depends(require_permissions("campaigns:read")),
     db: AsyncSession = Depends(get_db),
 ):
+    campaign_uuid = UUID(campaign_id)
     sort_by, sort_dir, limit = validate_table_query(
         table="campaign_recipients",
         sort_by=sort_by,
@@ -1116,7 +1119,7 @@ async def list_campaign_recipients(
     )
     stmt = select(CampaignRecipient).where(
         CampaignRecipient.business_id == actor.business.id,
-        CampaignRecipient.campaign_id == UUID(campaign_id),
+        CampaignRecipient.campaign_id == campaign_uuid,
         CampaignRecipient.deleted_at.is_(None),
     )
     if status:
@@ -1137,30 +1140,63 @@ async def list_campaign_recipients(
         filters={"status": status, "search": search},
     )
     sort_desc = str(sort_dir).lower() != "asc"
+    computed_query_fingerprint = _campaign_recipient_query_fingerprint(
+        business_id=actor.business.id,
+        campaign_id=campaign_uuid,
+        status=status,
+        search=search,
+        sort_by=sort_by,
+        sort_dir=sort_dir,
+    )
+    if request_query_fingerprint is not None and request_query_fingerprint != computed_query_fingerprint:
+        raise HTTPException(status_code=400, detail={"code": "CURSOR_QUERY_MISMATCH", "message": "Query fingerprint mismatch"})
     if cursor:
-        cursor_row = (
-            await db.execute(
-                select(CampaignRecipient.id, sort_key).where(
-                    CampaignRecipient.id == UUID(cursor),
-                    CampaignRecipient.business_id == actor.business.id,
-                    CampaignRecipient.campaign_id == UUID(campaign_id),
-                    CampaignRecipient.deleted_at.is_(None),
-                )
-            )
-        ).first()
-        if cursor_row is not None:
-            cursor_id, cursor_val = cursor_row
+        try:
+            payload = decode_cursor(cursor)
+            if payload.get("resource") != "campaign_recipients":
+                raise InvalidCursorError("Cursor resource mismatch")
+            if str(payload.get("businessId")) != str(actor.business.id):
+                raise InvalidCursorError("Cursor business mismatch")
+            if str(payload.get("campaignId")) != str(campaign_uuid):
+                raise InvalidCursorError("Cursor campaign mismatch")
+            if payload.get("queryFingerprint") != computed_query_fingerprint:
+                raise InvalidCursorError("CURSOR_QUERY_MISMATCH")
+            cursor_id = UUID(str(payload.get("id")))
+            cursor_val = payload.get("sortValue")
+            if sort_by in {"updated_at", "sent_at"} and cursor_val is not None:
+                cursor_val = datetime.fromisoformat(str(cursor_val))
             if cursor_val is not None:
                 if sort_desc:
                     stmt = stmt.where(or_(sort_key < cursor_val, and_(sort_key == cursor_val, CampaignRecipient.id < cursor_id)))
                 else:
                     stmt = stmt.where(or_(sort_key > cursor_val, and_(sort_key == cursor_val, CampaignRecipient.id > cursor_id)))
+        except (InvalidCursorError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_CURSOR", "message": str(exc)}) from exc
     total = int((await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one() or 0)
     order_primary = sort_key.desc() if sort_desc else sort_key.asc()
     order_secondary = CampaignRecipient.id.desc() if sort_desc else CampaignRecipient.id.asc()
     rows = (await db.execute(stmt.order_by(order_primary, order_secondary).limit(limit + 1))).scalars().all()
     page_rows = rows[:limit]
-    next_cursor = str(page_rows[-1].id) if len(rows) > limit and page_rows else None
+    next_cursor = None
+    if len(rows) > limit and page_rows:
+        last = page_rows[-1]
+        sort_value = getattr(last, sort_by, None)
+        if sort_by not in {"updated_at", "sent_at", "status"}:
+            sort_value = last.updated_at
+        if hasattr(sort_value, "isoformat"):
+            sort_value = sort_value.isoformat()
+        next_cursor = encode_cursor(
+            {
+                "resource": "campaign_recipients",
+                "businessId": str(actor.business.id),
+                "campaignId": str(campaign_uuid),
+                "queryFingerprint": computed_query_fingerprint,
+                "sortKey": sort_by,
+                "sortDir": sort_dir,
+                "sortValue": sort_value,
+                "id": str(last.id),
+            }
+        )
     items = [
         {
             "id": str(r.id),
@@ -1185,6 +1221,7 @@ async def list_campaign_recipients(
         "items": items,
         "next_cursor": next_cursor,
         "total": total,
+        "query_fingerprint": computed_query_fingerprint,
         "query_risk_class": query_risk.risk_class,
         "query_risk_reasons": query_risk.reasons,
         "freshness": freshness_live_db(),
@@ -1376,6 +1413,141 @@ async def get_campaign_health_score(
         campaign_id=UUID(campaign_id),
     )
     return result
+
+
+@router.get("/{campaign_id}/segment-diagnostics", response_model=dict)
+async def get_campaign_segment_diagnostics(
+    campaign_id: str,
+    actor: CurrentActor = Depends(require_permissions("campaigns:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    campaign_uuid = UUID(campaign_id)
+    campaign = (
+        await db.execute(
+            select(Campaign).where(
+                Campaign.id == campaign_uuid,
+                Campaign.business_id == actor.business.id,
+                Campaign.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if not campaign:
+        raise NotFoundException("Campaign not found")
+
+    rows = (
+        await db.execute(
+            select(CampaignRecipient, Contact)
+            .outerjoin(
+                Contact,
+                and_(
+                    Contact.id == CampaignRecipient.contact_id,
+                    Contact.business_id == actor.business.id,
+                    Contact.deleted_at.is_(None),
+                ),
+            )
+            .where(
+                CampaignRecipient.business_id == actor.business.id,
+                CampaignRecipient.campaign_id == campaign_uuid,
+                CampaignRecipient.deleted_at.is_(None),
+            )
+        )
+    ).all()
+
+    original_count = len(rows)
+    now = datetime.now(timezone.utc)
+    stale_cutoff = now - timedelta(days=180)
+    complain_cutoff = now - timedelta(days=90)
+
+    unclear_opt_in: set[str] = set()
+    stale_engagement: set[str] = set()
+    complained_or_refunded: set[str] = set()
+    outside_area: set[str] = set()
+    contact_ids: set[UUID] = set()
+    recipient_contact_map: dict[str, UUID] = {}
+
+    for recipient, contact in rows:
+        rid = str(recipient.id)
+        if recipient.contact_id:
+            recipient_contact_map[rid] = recipient.contact_id
+            contact_ids.add(recipient.contact_id)
+        if not contact:
+            unclear_opt_in.add(rid)
+            continue
+
+        if str(contact.opt_in_status or "").lower() != "opted_in" or contact.opt_in_timestamp is None:
+            unclear_opt_in.add(rid)
+
+        last_engaged_at = contact.last_seen_at or contact.last_message_at
+        if last_engaged_at is None or last_engaged_at < stale_cutoff:
+            stale_engagement.add(rid)
+
+        tags = [str(t).strip().lower() for t in (contact.tags or []) if str(t).strip()]
+        attrs = contact.custom_attributes or {}
+        complaint_flag = (
+            any(tag in {"complaint", "complained", "refund", "refunded", "chargeback", "dispute"} for tag in tags)
+            or bool(attrs.get("complaint"))
+            or bool(attrs.get("refund"))
+            or bool(attrs.get("chargeback"))
+        )
+        if complaint_flag and contact.updated_at >= complain_cutoff:
+            complained_or_refunded.add(rid)
+
+        outside_flag = (
+            bool(attrs.get("outside_delivery_area"))
+            or bool(attrs.get("out_of_delivery_area"))
+            or (attrs.get("delivery_area_allowed") is False)
+            or ("outside_delivery_area" in tags)
+            or ("out_of_area" in tags)
+        )
+        if outside_flag:
+            outside_area.add(rid)
+
+    ignored_contact_ids: set[UUID] = set()
+    if contact_ids:
+        ignored_rows = (
+            await db.execute(
+                select(
+                    CampaignRecipient.contact_id,
+                    func.count(CampaignRecipient.id),
+                )
+                .where(
+                    CampaignRecipient.business_id == actor.business.id,
+                    CampaignRecipient.contact_id.in_(list(contact_ids)),
+                    CampaignRecipient.campaign_id != campaign_uuid,
+                    CampaignRecipient.deleted_at.is_(None),
+                    CampaignRecipient.status.in_(["sent", "delivered", "read", "failed", "skipped"]),
+                    CampaignRecipient.replied_at.is_(None),
+                )
+                .group_by(CampaignRecipient.contact_id)
+                .having(func.count(CampaignRecipient.id) >= 3)
+            )
+        ).all()
+        ignored_contact_ids = {cid for cid, _ in ignored_rows if cid is not None}
+
+    ignored_campaigns: set[str] = set()
+    for rid, contact_id in recipient_contact_map.items():
+        if contact_id in ignored_contact_ids:
+            ignored_campaigns.add(rid)
+
+    risky_recipients = unclear_opt_in | stale_engagement | ignored_campaigns | complained_or_refunded | outside_area
+    safe_audience = max(0, original_count - len(risky_recipients))
+    expected_revenue_loss = "low" if len(risky_recipients) <= max(1, int(original_count * 0.6)) else "medium"
+    quality_risk_reduction = "high" if len(risky_recipients) >= max(1, int(original_count * 0.2)) else "medium"
+
+    return {
+        "campaign_id": str(campaign_uuid),
+        "original_count": original_count,
+        "safe_audience_count": safe_audience,
+        "expected_revenue_loss": expected_revenue_loss,
+        "quality_risk_reduction": quality_risk_reduction,
+        "issues": {
+            "unclear_opt_in": len(unclear_opt_in),
+            "stale_engagement_180d": len(stale_engagement),
+            "ignored_3plus_campaigns": len(ignored_campaigns),
+            "complained_or_refunded_recently": len(complained_or_refunded),
+            "outside_delivery_area": len(outside_area),
+        },
+    }
 
 
 @router.get("/{campaign_id}/whatsapp-health", response_model=dict)
@@ -1644,8 +1816,7 @@ async def export_campaign(
     ).scalars().all()
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(
-        [
+    header = [
             "campaign_id",
             "recipient_id",
             "phone_e164",
@@ -1661,10 +1832,10 @@ async def export_campaign(
             "last_error_code",
             "last_error_message",
         ]
-    )
+    writer.writerow([escape_csv_cell(c) for c in header])
     for r in recipients:
         writer.writerow(
-            [
+            [escape_csv_cell(v) for v in [
                 str(campaign.id),
                 str(r.id),
                 r.phone_e164,
@@ -1679,7 +1850,7 @@ async def export_campaign(
                 r.failed_at.isoformat() if r.failed_at else "",
                 r.last_error_code or "",
                 r.last_error_message or "",
-            ]
+            ]]
         )
     content = buf.getvalue().encode("utf-8")
     key = object_storage_service.put_bytes(
@@ -1732,6 +1903,20 @@ async def create_campaign_export_job(
         status="pending",
     )
     db.add(job)
+    await db.flush()
+    db.add(
+        OutboxEvent(
+            business_id=actor.business.id,
+            campaign_id=campaign.id,
+            operation_id=operation_id,
+            event_type="campaign_export.process_job",
+            payload_json={
+                "job_operation_id": str(job.id),
+                "campaign_id": str(campaign.id),
+            },
+            status="pending",
+        )
+    )
     await db.commit()
     await db.refresh(job)
     return {
@@ -1778,92 +1963,11 @@ async def get_campaign_export_job(
     if payload_campaign_id != str(campaign.id):
         raise NotFoundException("Export job not found for this campaign")
 
-    # Server-driven progress state machine; job materializes output when polled.
-    if job.status == "pending":
-        payload["status"] = "running"
-        payload["progress"] = 35
-        job.status = "running"
-        job.payload_json = payload
-        await db.commit()
-    elif job.status == "running":
-        recipients = (
-            await db.execute(
-                select(CampaignRecipient).where(
-                    CampaignRecipient.business_id == actor.business.id,
-                    CampaignRecipient.campaign_id == campaign.id,
-                    CampaignRecipient.deleted_at.is_(None),
-                ).order_by(CampaignRecipient.created_at.asc(), CampaignRecipient.id.asc())
-            )
-        ).scalars().all()
-        buf = io.StringIO()
-        writer = csv.writer(buf)
-        writer.writerow(
-            [
-                "campaign_id",
-                "recipient_id",
-                "phone_e164",
-                "status",
-                "eligibility_status",
-                "eligibility_reason",
-                "provider_message_id",
-                "attempt_count",
-                "sent_at",
-                "delivered_at",
-                "read_at",
-                "failed_at",
-                "last_error_code",
-                "last_error_message",
-            ]
-        )
-        for r in recipients:
-            writer.writerow(
-                [
-                    str(campaign.id),
-                    str(r.id),
-                    r.phone_e164,
-                    r.status,
-                    r.eligibility_status,
-                    r.eligibility_reason or "",
-                    r.provider_message_id or "",
-                    int(r.attempt_count or 0),
-                    r.sent_at.isoformat() if r.sent_at else "",
-                    r.delivered_at.isoformat() if r.delivered_at else "",
-                    r.read_at.isoformat() if r.read_at else "",
-                    r.failed_at.isoformat() if r.failed_at else "",
-                    r.last_error_code or "",
-                    r.last_error_message or "",
-                ]
-            )
-        content = buf.getvalue().encode("utf-8")
-        key = object_storage_service.put_bytes(
-            namespace="campaign_exports",
-            filename_hint=f"campaign_{campaign.id}.csv",
-            content=content,
-        )
-        payload["status"] = "completed"
-        payload["progress"] = 100
-        payload["download_url"] = object_storage_service.build_url(key)
-        payload["storage_key"] = key
-        payload["rows"] = len(recipients)
-        job.status = "completed"
-        job.payload_json = payload
-        await db.commit()
-
-    refreshed = (
-        await db.execute(
-            select(JobOperation).where(
-                JobOperation.id == job.id,
-                JobOperation.business_id == actor.business.id,
-                JobOperation.deleted_at.is_(None),
-            )
-        )
-    ).scalar_one()
-    payload = dict(refreshed.payload_json or {})
     return {
-        "job_id": str(refreshed.id),
+        "job_id": str(job.id),
         "campaign_id": str(campaign.id),
-        "status": str(payload.get("status") or refreshed.status),
-        "progress": int(payload.get("progress") or (100 if refreshed.status == "completed" else 5)),
+        "status": str(payload.get("status") or job.status),
+        "progress": int(payload.get("progress") or (100 if job.status == "completed" else 5)),
         "download_url": payload.get("download_url"),
         "storage_key": payload.get("storage_key"),
         "rows": int(payload.get("rows") or 0),

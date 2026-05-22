@@ -1,10 +1,9 @@
 import uuid
 import json
 import hashlib
-import base64
-import hmac
 from datetime import datetime, timezone, timedelta
-from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Request
+from fastapi import APIRouter, Depends, File, UploadFile, HTTPException, Request, Query, Header
+from fastapi.responses import FileResponse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,23 +18,38 @@ from app.schemas.contact import (
     ContactBlockRequest,
     ContactCSVValidationRequest,
     ContactCsvImportExecuteRequest,
+    ContactAgentCaptureRequest,
+    ContactQrOptInCaptureRequest,
+    ContactOfflineRegistrationRequest,
     ContactDuplicateSuggestionResponse,
+    ContactExportJobCreateRequest,
+    ContactBulkSuppressPreviewRequest,
+    ContactBulkSuppressConfirmRequest,
+    ContactBulkTagRequest,
     ContactMergeRequest,
     ContactOptInRequest,
+    ContactListResponse,
     ContactResponse,
     ContactSegmentResponse,
     ContactSegmentUpsertRequest,
     ContactUpdateRequest,
     ContactUpsertRequest,
 )
+from app.schemas.list_query import ListQueryRequest
+from app.schemas.pagination import CursorPage
+from app.filters.contact_filters import InvalidFilterError
 from app.services.contact_dedup_service import ContactDedupService
 from app.services.contact_hygiene_service import contact_hygiene_service
 from app.services.contact_import_service import ContactImportService
+from app.services.contact_service import ContactService
 from app.services.contact_segment_service import ContactSegmentService
-from app.config import settings
 from app.services.table_registry import validate_table_query, get_table_config
 from app.services.query_cost_service import classify_table_query, classify_bulk_action
 from app.services.data_freshness_service import freshness_live_db, freshness_snapshot
+from app.services.idempotency_service import IdempotencyService
+from app.services.object_storage_service import object_storage_service
+from app.utils.cursor import decode_cursor, encode_cursor, InvalidCursorError, stable_filters_hash
+from app.core.exceptions import BadRequestException, NotFoundException
 
 router = APIRouter(prefix="/contacts", tags=["Contacts"])
 CONTACT_TABLE_ALLOWED_SORTS = {"updated_at", "created_at"}
@@ -49,6 +63,30 @@ SENSITIVE_COLUMN_PERMISSIONS = {
     "revenue": "analytics:columns:revenue",
     "campaign_errors": "campaigns:columns:errors",
 }
+ALLOWED_AGENT_TAGS = {
+    "purchase",
+    "enquiry",
+    "follow_up",
+    "hot_lead",
+    "existing_customer",
+    "walk_in_customer",
+    "converted",
+}
+
+
+def _clean_amount(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace(",", "").replace("₹", "").replace("INR", "").strip()
+    try:
+        return float(normalized)
+    except ValueError:
+        raise BadRequestException("amount must be a valid number")
 
 
 def _to_response(row) -> ContactResponse:
@@ -106,42 +144,33 @@ def _validate_contact_table_query_contract(*, sort_by: str, sort_dir: str, limit
     )
 
 
-def _encode_signed_contact_cursor(*, business_id, sort_by: str, sort_dir: str, cursor_key: datetime, cursor_id: uuid.UUID) -> str:
+def _encode_signed_contact_cursor(*, business_id, sort_by: str, sort_dir: str, cursor_key: datetime, cursor_id: uuid.UUID, filters_hash: str) -> str:
     payload = {
         "business_id": str(business_id),
-        "sort_by": sort_by,
-        "sort_dir": sort_dir,
-        "cursor_key": cursor_key.astimezone(timezone.utc).isoformat(),
-        "cursor_id": str(cursor_id),
+        "sortKey": sort_by,
+        "sortDir": sort_dir,
+        "sortValue": cursor_key.astimezone(timezone.utc).isoformat(),
+        "id": str(cursor_id),
+        "filtersHash": filters_hash,
     }
-    payload_raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    signature = hmac.new(settings.SECRET_KEY.encode("utf-8"), payload_raw, hashlib.sha256).hexdigest().encode("utf-8")
-    return (
-        base64.urlsafe_b64encode(payload_raw).decode("utf-8")
-        + "."
-        + base64.urlsafe_b64encode(signature).decode("utf-8")
-    )
+    return encode_cursor(payload)
 
 
-def _decode_signed_contact_cursor(*, token: str, business_id, sort_by: str, sort_dir: str) -> tuple[datetime, uuid.UUID] | None:
+def _decode_signed_contact_cursor(*, token: str, business_id, sort_by: str, sort_dir: str, filters_hash: str) -> tuple[datetime, uuid.UUID] | None:
     try:
-        payload_enc, sig_enc = token.split(".", 1)
-        payload_raw = base64.urlsafe_b64decode(payload_enc.encode("utf-8"))
-        given_sig = base64.urlsafe_b64decode(sig_enc.encode("utf-8"))
-        expected_sig = hmac.new(settings.SECRET_KEY.encode("utf-8"), payload_raw, hashlib.sha256).hexdigest().encode("utf-8")
-        if not hmac.compare_digest(given_sig, expected_sig):
-            return None
-        payload = json.loads(payload_raw.decode("utf-8"))
+        payload = decode_cursor(token)
         if str(payload.get("business_id")) != str(business_id):
             return None
-        if str(payload.get("sort_by")) != sort_by or str(payload.get("sort_dir")) != sort_dir:
+        if str(payload.get("sortKey")) != sort_by or str(payload.get("sortDir")) != sort_dir:
             return None
-        key = datetime.fromisoformat(str(payload.get("cursor_key")))
+        if str(payload.get("filtersHash") or "") != str(filters_hash):
+            return None
+        key = datetime.fromisoformat(str(payload.get("sortValue")))
         if key.tzinfo is None:
             key = key.replace(tzinfo=timezone.utc)
-        cid = uuid.UUID(str(payload.get("cursor_id")))
+        cid = uuid.UUID(str(payload.get("id")))
         return key.astimezone(timezone.utc), cid
-    except Exception:
+    except (InvalidCursorError, Exception):
         return None
 
 
@@ -414,6 +443,67 @@ def _project_contact_record_for_actor(actor: CurrentActor, record: dict) -> dict
     return out
 
 
+def _raise_list_query_http_error(exc: Exception) -> None:
+    if isinstance(exc, InvalidFilterError):
+        message = str(exc)
+        code = "INVALID_FILTER_FIELD" if "field" in message.lower() else "INVALID_FILTER_OPERATOR"
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "code": code,
+                    "message": message,
+                    "details": {"allowedFilters": ["status", "optInStatus", "source", "createdAt", "tags"]},
+                }
+            },
+        ) from exc
+    if isinstance(exc, InvalidCursorError):
+        message = str(exc)
+        code = "CURSOR_QUERY_MISMATCH" if "MISMATCH" in message.upper() else "INVALID_CURSOR"
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": code, "message": message}},
+        ) from exc
+    if isinstance(exc, ValueError):
+        message = str(exc)
+        code = "SEARCH_TOO_LONG" if "SEARCH_TOO_LONG" in message else "INVALID_SEARCH_QUERY"
+        raise HTTPException(
+            status_code=400,
+            detail={"error": {"code": code, "message": message}},
+        ) from exc
+    raise exc
+
+
+def _legacy_query_to_list_query_request(
+    *,
+    limit: int,
+    cursor: str | None,
+    search: str | None,
+    sort_key: str,
+    sort_dir: str,
+    status: str | None = None,
+    tag: str | None = None,
+    opt_in_status: str | None = None,
+    suppressed: bool | None = None,
+) -> ListQueryRequest:
+    filters: list[dict] = []
+    if status:
+        filters.append({"field": "status", "operator": "equals", "value": status})
+    if opt_in_status:
+        filters.append({"field": "optInStatus", "operator": "equals", "value": opt_in_status})
+    if tag:
+        filters.append({"field": "tags", "operator": "includes_any", "values": [tag]})
+    if suppressed is True:
+        filters.append({"field": "status", "operator": "in", "values": ["blocked"]})
+    return ListQueryRequest(
+        limit=limit,
+        cursor=cursor,
+        search=search,
+        sort={"key": sort_key, "dir": sort_dir},
+        filterGroup={"logic": "AND", "filters": filters},
+    )
+
+
 @router.post("/import/validate", response_model=dict)
 async def validate_contact_csv(
     payload: ContactCSVValidationRequest,
@@ -473,109 +563,49 @@ async def upsert_contact(
     return _to_response(row)
 
 
-@router.get("", response_model=list[ContactResponse])
+@router.get("", response_model=dict, deprecated=True)
 async def list_contacts(
+    limit: int = Query(default=50, ge=1, le=100),
+    cursor: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    sortKey: str = Query(default="updated_at"),
+    sortDir: str = Query(default="desc"),
     actor: CurrentActor = Depends(require_permissions("contacts:read")),
     db: AsyncSession = Depends(get_db),
 ):
-    rows = await ContactRepository(db).list_for_business(actor.business.id, limit=200)
-    return [_to_response(r) for r in rows]
-
-
-@router.get("/crm/records", response_model=dict)
-async def list_contact_crm_records(
-    search: str | None = None,
-    tag: str | None = None,
-    opt_in_status: str | None = None,
-    suppressed: bool | None = None,
-    segment_id: str | None = None,
-    cursor: str | None = None,
-    sort_by: str = "updated_at",
-    sort_dir: str = "desc",
-    limit: int = 200,
-    actor: CurrentActor = Depends(require_permissions("contacts:read")),
-    db: AsyncSession = Depends(get_db),
-):
-    sort_by, sort_dir, normalized_limit = validate_table_query(
-        table="contacts",
-        sort_by=sort_by,
-        sort_dir=sort_dir,
-        limit=limit,
-        filters={"tag": tag, "opt_in_status": opt_in_status, "suppressed": suppressed, "segment_id": segment_id, "search": search},
-    )
-    normalized_query = _normalize_contact_query_payload(
-        search=search,
-        tag=tag,
-        opt_in_status=opt_in_status,
-        suppressed=suppressed,
-        segment_id=segment_id,
-        sort_by=sort_by,
-        sort_dir=sort_dir,
-    )
-    applied_query_hash = _contact_query_hash(business_id=actor.business.id, query_payload=normalized_query)
-    query_risk = classify_table_query(
-        table="contacts",
-        sort_by=sort_by,
-        limit=normalized_limit,
-        filters={"search": search, "tag": tag, "opt_in_status": opt_in_status, "suppressed": suppressed},
-    )
-
-    stmt = await _build_contacts_query_stmt(
-        db=db,
-        business_id=actor.business.id,
-        search=normalized_query.get("search"),
-        tag=normalized_query.get("tag"),
-        opt_in_status=normalized_query.get("opt_in_status"),
-        suppressed=normalized_query.get("suppressed"),
-        segment_id=normalized_query.get("segment_id"),
-    )
-    sort_key = Contact.updated_at if sort_by == "updated_at" else Contact.created_at
-    sort_desc = str(sort_dir).lower() != "asc"
-    if cursor:
-        parsed = _decode_signed_contact_cursor(
-            token=cursor,
-            business_id=actor.business.id,
-            sort_by=sort_by,
-            sort_dir=sort_dir,
+    repository = ContactRepository(db)
+    service = ContactService(repository)
+    try:
+        query = _legacy_query_to_list_query_request(
+            limit=limit,
+            cursor=cursor,
+            search=search,
+            sort_key=sortKey,
+            sort_dir=sortDir,
         )
-        if parsed is None:
-            raise HTTPException(status_code=400, detail="Invalid cursor")
-        cursor_key, cursor_id = parsed
-        if sort_desc:
-            stmt = stmt.where(or_(sort_key < cursor_key, and_(sort_key == cursor_key, Contact.id < cursor_id)))
-        else:
-            stmt = stmt.where(or_(sort_key > cursor_key, and_(sort_key == cursor_key, Contact.id > cursor_id)))
+        return await service.search_contacts(
+            business_id=actor.business.id,
+            query=query,
+        )
+    except Exception as exc:
+        _raise_list_query_http_error(exc)
 
-    total_stmt = select(func.count()).select_from(stmt.subquery())
-    total = int((await db.execute(total_stmt)).scalar_one() or 0)
-    order_primary = sort_key.desc() if sort_desc else sort_key.asc()
-    order_secondary = Contact.id.desc() if sort_desc else Contact.id.asc()
-    rows = (await db.execute(stmt.order_by(order_primary, order_secondary).limit(normalized_limit + 1))).scalars().all()
-    page_rows = rows[: normalized_limit]
-    next_cursor = None
-    if len(rows) > normalized_limit and page_rows:
-        last_row = page_rows[-1]
-        cursor_key = last_row.updated_at if sort_by == "updated_at" else last_row.created_at
-        if cursor_key is not None:
-            next_cursor = _encode_signed_contact_cursor(
-                business_id=actor.business.id,
-                sort_by=sort_by,
-                sort_dir=sort_dir,
-                cursor_key=cursor_key,
-                cursor_id=last_row.id,
-            )
-    out: list[dict] = []
-    for row in page_rows:
-        out.append(_project_contact_record_for_actor(actor, await _build_contact_record(db, actor.business.id, row)))
-    return {
-        "items": out,
-        "next_cursor": next_cursor,
-        "total": total,
-        "applied_query_hash": applied_query_hash,
-        "query_risk_class": query_risk.risk_class,
-        "query_risk_reasons": query_risk.reasons,
-        "freshness": freshness_live_db(),
-    }
+
+@router.post("/search", response_model=dict)
+async def search_contacts_contract(
+    query: ListQueryRequest,
+    actor: CurrentActor = Depends(require_permissions("contacts:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    repository = ContactRepository(db)
+    service = ContactService(repository)
+    try:
+        return await service.search_contacts(
+            business_id=actor.business.id,
+            query=query,
+        )
+    except Exception as exc:
+        _raise_list_query_http_error(exc)
 
 
 @router.post("/query-snapshots", response_model=dict)
@@ -855,23 +885,36 @@ async def get_contact_approx_counts(
 
 @router.post("/export-jobs", response_model=dict)
 async def create_contact_export_job(
-    payload: dict,
+    payload: ContactExportJobCreateRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     actor: CurrentActor = Depends(require_permissions("contacts:read")),
     db: AsyncSession = Depends(get_db),
 ):
-    selection = payload.get("selection") or {}
-    if not isinstance(selection, dict):
-        selection = {"mode": "explicit", "ids": []}
-    selection_mode = str(selection.get("mode") or "explicit").strip().lower()
-    if selection_mode not in {"explicit", "all_matching_query"}:
-        raise HTTPException(status_code=400, detail="Unsupported selection.mode")
-    resolved_selection_ids = await _resolve_selection_contact_ids(payload=payload, actor=actor, db=db)
-    explicit_legacy_ids = _selection_ids_from_payload(payload)
-    if not resolved_selection_ids and explicit_legacy_ids:
-        resolved_selection_ids = [uuid.UUID(x) for x in explicit_legacy_ids]
-    excluded_ids = [str(x).strip() for x in (selection.get("excludedIds") or []) if str(x).strip()]
-    query_snapshot = await _fetch_query_snapshot_for_selection(payload=payload, actor=actor, db=db)
-    export_columns = payload.get("columns") or [
+    if not idempotency_key or not str(idempotency_key).strip():
+        raise BadRequestException("Idempotency-Key header is required")
+    payload_dict = payload.model_dump(mode="json")
+    replay = await IdempotencyService(db).begin_or_replay(actor.business.id, idempotency_key.strip(), payload_dict)
+    if replay is not None:
+        return replay
+    query_snapshot = (
+        await db.execute(
+            select(QuerySnapshot).where(
+                QuerySnapshot.id == payload.query_snapshot_id,
+                QuerySnapshot.business_id == actor.business.id,
+                QuerySnapshot.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if query_snapshot is None:
+        raise NotFoundException("query_snapshot not found")
+    if query_snapshot.expires_at is not None and query_snapshot.expires_at <= datetime.now(timezone.utc):
+        raise BadRequestException("query_snapshot expired")
+    resolver_payload = {
+        "selection": {"mode": "all_matching_query", "excludedIds": []},
+        "query_snapshot_id": str(payload.query_snapshot_id),
+    }
+    resolved_selection_ids = await _resolve_selection_contact_ids(payload=resolver_payload, actor=actor, db=db)
+    export_columns = payload.columns or [
         "contact_id",
         "name",
         "email",
@@ -881,7 +924,7 @@ async def create_contact_export_job(
         "tags",
         "updated_at",
     ]
-    if not isinstance(export_columns, list) or not export_columns:
+    if not export_columns:
         export_columns = ["contact_id", "name", "email", "phone_e164", "wa_id", "opt_in_status", "tags", "updated_at"]
     table_cfg = get_table_config("contacts")
     allowed_export_set = set(table_cfg.exportable_columns)
@@ -914,10 +957,10 @@ async def create_contact_export_job(
     job = ContactExportJob(
         business_id=actor.business.id,
         requested_by_user_id=actor.user.id,
-        query_snapshot_id=(query_snapshot.id if query_snapshot else None),
-        selection_mode=selection_mode,
+        query_snapshot_id=query_snapshot.id,
+        selection_mode="snapshot",
         selected_contact_ids_json=[str(x) for x in resolved_selection_ids],
-        excluded_contact_ids_json=excluded_ids,
+        excluded_contact_ids_json=[],
         columns_json=filtered_columns,
         status="pending",
         progress=5,
@@ -935,7 +978,7 @@ async def create_contact_export_job(
     )
     await db.commit()
     await db.refresh(job)
-    return {
+    response = {
         "job_id": str(job.id),
         "status": str(job.status),
         "progress": int(job.progress or 0),
@@ -943,6 +986,8 @@ async def create_contact_export_job(
         "query_risk_reasons": action_risk.reasons,
         "approx_affected": approx_affected,
     }
+    await IdempotencyService(db).finalize(actor.business.id, idempotency_key.strip(), response)
+    return response
 
 
 @router.post("/bulk-jobs", response_model=dict)
@@ -1170,30 +1215,156 @@ async def get_contact_export_job(
         "job_id": str(job.id),
         "status": str(job.status or "pending"),
         "progress": int(job.progress or 0),
-        "download_url": job.download_url,
-        "storage_key": job.storage_key,
+        "download_ready": bool(job.download_url),
         "rows": int(job.total_rows or 0),
         "error_code": job.error_code,
         "error_message": job.error_message,
     }
 
 
-@router.post("/bulk-suppress", response_model=dict)
-async def bulk_suppress_contacts(
-    payload: dict,
+@router.get("/exports/{job_id}/download-token", response_model=dict)
+async def get_contact_export_download_token(
+    job_id: str,
+    actor: CurrentActor = Depends(require_permissions("contacts:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    job = (
+        await db.execute(
+            select(ContactExportJob).where(
+                ContactExportJob.id == uuid.UUID(job_id),
+                ContactExportJob.business_id == actor.business.id,
+                ContactExportJob.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if not job:
+        raise NotFoundException("Export job not found")
+    if str(job.status or "").lower() != "completed" or not job.download_url:
+        raise BadRequestException("Export is not ready")
+    storage_key = str(job.storage_key or "").strip()
+    if not storage_key.startswith("contact_exports/") or ".." in storage_key:
+        raise BadRequestException("Export path is invalid")
+    signed_url, expires_at = object_storage_service.build_signed_download_url(storage_key, expires_in_seconds=600)
+    return {
+        "download_url": signed_url,
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@router.get("/exports/download/{token}")
+async def download_contact_export_file(
+    token: str,
+    actor: CurrentActor = Depends(require_permissions("contacts:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        storage_key = object_storage_service.resolve_signed_download_token(token)
+    except ValueError:
+        raise BadRequestException("Invalid or expired download token")
+    job = (
+        await db.execute(
+            select(ContactExportJob).where(
+                ContactExportJob.business_id == actor.business.id,
+                ContactExportJob.storage_key == storage_key,
+                ContactExportJob.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if job is None:
+        raise NotFoundException("Export job not found for download token")
+    file_path = object_storage_service.base_dir / storage_key
+    if not file_path.exists() or not file_path.is_file():
+        raise NotFoundException("Export file not found")
+    return FileResponse(path=str(file_path), filename=file_path.name, media_type="text/csv")
+
+
+@router.post("/bulk-suppress/preview", response_model=dict)
+async def bulk_suppress_contacts_preview(
+    payload: ContactBulkSuppressPreviewRequest,
     actor: CurrentActor = Depends(require_permissions("contacts:write")),
     db: AsyncSession = Depends(get_db),
 ):
-    dry_run = bool(payload.get("dry_run") is True or payload.get("dryRun") is True)
-    contact_ids = await _resolve_selection_contact_ids(payload=payload, actor=actor, db=db)
+    resolver_payload = {
+        "selection": {"mode": "all_matching_query", "excludedIds": []},
+        "query_snapshot_id": str(payload.query_snapshot_id),
+    }
+    contact_ids = await _resolve_selection_contact_ids(payload=resolver_payload, actor=actor, db=db)
     if not contact_ids:
-        return {"status": "no_selection", "suppressed_count": 0}
+        return {"status": "no_selection", "affected_count": 0}
     unique_ids = list(dict.fromkeys(contact_ids))
-    if dry_run:
-        return {"status": "dry_run", "suppressed_count": len(unique_ids), "dry_run": True}
+    confirmation_hash = hashlib.sha256(
+        f"{actor.business.id}:{payload.operation_id}:{payload.query_snapshot_id}:{len(unique_ids)}".encode("utf-8")
+    ).hexdigest()
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    row = QuerySnapshot(
+        business_id=actor.business.id,
+        resource="bulk_suppress_confirmation",
+        query_hash=confirmation_hash,
+        query_json={
+            "operation_id": payload.operation_id,
+            "query_snapshot_id": str(payload.query_snapshot_id),
+            "selection_mode": "snapshot",
+            "affected_count": len(unique_ids),
+        },
+        status="active",
+        expires_at=expires_at,
+        created_by_user_id=actor.user.id,
+    )
+    db.add(row)
+    await db.commit()
+    return {
+        "status": "preview_ready",
+        "affected_count": len(unique_ids),
+        "confirmation_hash": confirmation_hash,
+        "expires_at": expires_at.isoformat(),
+    }
+
+
+@router.post("/bulk-suppress/confirm", response_model=dict)
+async def bulk_suppress_contacts_confirm(
+    payload: ContactBulkSuppressConfirmRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    actor: CurrentActor = Depends(require_permissions("contacts:write")),
+    db: AsyncSession = Depends(get_db),
+):
+    if not idempotency_key or not str(idempotency_key).strip():
+        raise BadRequestException("Idempotency-Key header is required")
+    payload_dict = payload.model_dump(mode="json")
+    replay = await IdempotencyService(db).begin_or_replay(actor.business.id, idempotency_key.strip(), payload_dict)
+    if replay is not None:
+        return replay
+    confirmation_row = (
+        await db.execute(
+            select(QuerySnapshot).where(
+                QuerySnapshot.business_id == actor.business.id,
+                QuerySnapshot.resource == "bulk_suppress_confirmation",
+                QuerySnapshot.query_hash == payload.confirmation_hash,
+                QuerySnapshot.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if confirmation_row is None:
+        raise BadRequestException("Invalid confirmation hash")
+    if confirmation_row.expires_at is not None and confirmation_row.expires_at <= datetime.now(timezone.utc):
+        raise BadRequestException("Confirmation hash expired")
+    frozen = confirmation_row.query_json or {}
+    if str(frozen.get("operation_id") or "") != payload.operation_id:
+        raise BadRequestException("operation_id does not match confirmation hash")
+    query_snapshot_id = str(frozen.get("query_snapshot_id") or "").strip()
+    if not query_snapshot_id:
+        raise BadRequestException("Missing query snapshot in confirmation payload")
+    resolver_payload = {
+        "selection": {"mode": "all_matching_query", "excludedIds": []},
+        "query_snapshot_id": query_snapshot_id,
+    }
+    contact_ids = await _resolve_selection_contact_ids(payload=resolver_payload, actor=actor, db=db)
+    if not contact_ids:
+        response = {"status": "no_selection", "suppressed_count": 0}
+        await IdempotencyService(db).finalize(actor.business.id, idempotency_key.strip(), response)
+        return response
     repo = ContactRepository(db)
     suppressed_count = 0
-    for cid in unique_ids:
+    for cid in list(dict.fromkeys(contact_ids)):
         row = await repo.set_blocked(
             business_id=actor.business.id,
             contact_id=cid,
@@ -1213,7 +1384,58 @@ async def bulk_suppress_contacts(
                 )
             )
     await db.commit()
-    return {"status": "ok", "suppressed_count": suppressed_count}
+    response = {"status": "completed", "suppressed_count": suppressed_count}
+    await IdempotencyService(db).finalize(actor.business.id, idempotency_key.strip(), response)
+    return response
+
+
+@router.post("/bulk-suppress", response_model=dict)
+async def bulk_suppress_contacts(
+    actor: CurrentActor = Depends(require_permissions("contacts:write")),
+):
+    raise BadRequestException("Use /contacts/bulk-suppress/preview then /contacts/bulk-suppress/confirm")
+
+
+@router.post("/bulk-tag", response_model=dict)
+async def bulk_tag_contacts(
+    payload: ContactBulkTagRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    actor: CurrentActor = Depends(require_permissions("contacts:write")),
+    db: AsyncSession = Depends(get_db),
+):
+    if not idempotency_key or not str(idempotency_key).strip():
+        raise BadRequestException("Idempotency-Key header is required")
+    payload_dict = payload.model_dump(mode="json")
+    replay = await IdempotencyService(db).begin_or_replay(actor.business.id, idempotency_key.strip(), payload_dict)
+    if replay is not None:
+        return replay
+    resolver_payload = {
+        "selection": {"mode": "all_matching_query", "excludedIds": []},
+        "query_snapshot_id": str(payload.query_snapshot_id),
+    }
+    contact_ids = await _resolve_selection_contact_ids(payload=resolver_payload, actor=actor, db=db)
+    if not contact_ids:
+        response = {"status": "no_selection", "affected_count": 0}
+        await IdempotencyService(db).finalize(actor.business.id, idempotency_key.strip(), response)
+        return response
+    repo = ContactRepository(db)
+    affected = 0
+    normalized_tag = payload.tag.strip().lower()
+    for cid in list(dict.fromkeys(contact_ids)):
+        row = await repo.get_by_id_for_business(actor.business.id, cid)
+        if row is None:
+            continue
+        existing = [str(t).strip().lower() for t in (row.tags or []) if str(t).strip()]
+        if payload.action == "add":
+            next_tags = sorted(set(existing + [normalized_tag]))
+        else:
+            next_tags = [t for t in existing if t != normalized_tag]
+        row.tags = next_tags
+        affected += 1
+    await db.commit()
+    response = {"status": "completed", "affected_count": affected, "action": payload.action, "tag": normalized_tag}
+    await IdempotencyService(db).finalize(actor.business.id, idempotency_key.strip(), response)
+    return response
 
 
 @router.get("/{contact_id}/record", response_model=dict)
@@ -1228,6 +1450,298 @@ async def get_contact_record(
     return _project_contact_record_for_actor(actor, await _build_contact_record(db, actor.business.id, row))
 
 
+@router.post("/{contact_id}/agent-capture", response_model=dict)
+async def capture_contact_agent_event(
+    contact_id: str,
+    payload: ContactAgentCaptureRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    actor: CurrentActor = Depends(require_permissions("contacts:write")),
+    db: AsyncSession = Depends(get_db),
+):
+    row = await ContactRepository(db).get_by_id_for_business(actor.business.id, uuid.UUID(contact_id))
+    if not row:
+        raise NotFoundException("Contact not found")
+    if not idempotency_key or not str(idempotency_key).strip():
+        raise BadRequestException("Idempotency-Key header is required")
+
+    incoming = payload.model_dump(exclude_none=True)
+    replay = await IdempotencyService(db).begin_or_replay(
+        business_id=actor.business.id,
+        key=f"contacts:agent_capture:{contact_id}:{str(idempotency_key).strip()}",
+        payload={"contact_id": contact_id, **incoming},
+    )
+    if replay is not None:
+        return replay
+
+    attrs = dict(row.custom_attributes or {})
+    current_tags = sorted({str(t).strip().lower() for t in (row.tags or []) if str(t).strip()})
+    merged_tags = set(current_tags)
+
+    event_type = str(payload.event_type).strip().lower()
+    event_tag_map = {
+        "add_purchase": "purchase",
+        "add_enquiry": "enquiry",
+        "add_follow_up": "follow_up",
+        "mark_hot_lead": "hot_lead",
+        "mark_existing_customer": "existing_customer",
+        "mark_walk_in_customer": "walk_in_customer",
+        "mark_converted": "converted",
+    }
+    derived_tag = event_tag_map.get(event_type)
+    if derived_tag:
+        merged_tags.add(derived_tag)
+    if payload.tag is not None:
+        tag = str(payload.tag).strip().lower().replace(" ", "_")
+        if tag not in ALLOWED_AGENT_TAGS:
+            raise BadRequestException(f"Tag '{tag}' is not allowed")
+        merged_tags.add(tag)
+
+    amount = _clean_amount(payload.amount)
+    if amount is not None and amount < 0:
+        raise BadRequestException("amount must be >= 0")
+
+    if payload.captured_at:
+        captured_at = payload.captured_at
+        if captured_at.tzinfo is None:
+            captured_at = captured_at.replace(tzinfo=timezone.utc)
+        else:
+            captured_at = captured_at.astimezone(timezone.utc)
+    else:
+        captured_at = datetime.now(timezone.utc)
+    visit_logs = attrs.get("offline_visit_logs")
+    if not isinstance(visit_logs, list):
+        visit_logs = []
+    event_entry = {
+        "captured_at": captured_at.isoformat(),
+        "event_type": event_type,
+        "tag": payload.tag.strip().lower().replace(" ", "_") if payload.tag else None,
+        "purchased_item": payload.purchased_item.strip() if payload.purchased_item else None,
+        "amount": amount,
+        "next_follow_up": payload.next_follow_up.strip() if payload.next_follow_up else None,
+        "note": payload.note.strip() if payload.note else None,
+        "captured_by_user_id": str(actor.user.id),
+    }
+    visit_logs.append(event_entry)
+    attrs["offline_visit_logs"] = visit_logs[-200:]
+
+    if payload.purchased_item:
+        attrs["last_product"] = payload.purchased_item.strip()
+    if amount is not None:
+        attrs["total_spend"] = amount
+    if payload.next_follow_up:
+        attrs["next_follow_up"] = payload.next_follow_up.strip()
+    if payload.note:
+        notes = attrs.get("notes")
+        if not isinstance(notes, list):
+            notes = []
+        notes.append(payload.note.strip())
+        attrs["notes"] = notes[-200:]
+
+    row.tags = sorted(merged_tags)
+    row.custom_attributes = attrs
+    row.last_seen_at = datetime.now(timezone.utc)
+    db.add(
+        AuditLog(
+            business_id=actor.business.id,
+            user_id=actor.user.id,
+            actor_type="user",
+            actor_id=str(actor.user.id),
+            operation_id=str(idempotency_key).strip(),
+            action="contact_agent_capture",
+            resource_type="contact",
+            resource_id=str(row.id),
+            status="success",
+            details={"event_type": event_type, "tag_count": len(row.tags or []), "captured_at": captured_at.isoformat()},
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+
+    response = {
+        "status": "ok",
+        "contact_id": str(row.id),
+        "event_type": event_type,
+        "tags": row.tags or [],
+        "custom_attributes": row.custom_attributes or {},
+        "captured_at": captured_at.isoformat(),
+    }
+    await IdempotencyService(db).finalize(
+        business_id=actor.business.id,
+        key=f"contacts:agent_capture:{contact_id}:{str(idempotency_key).strip()}",
+        response_json=response,
+    )
+    return response
+
+
+@router.post("/qr-opt-ins/capture", response_model=dict)
+async def capture_qr_opt_in(
+    payload: ContactQrOptInCaptureRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    actor: CurrentActor = Depends(require_permissions("contacts:write")),
+    db: AsyncSession = Depends(get_db),
+):
+    if not idempotency_key or not str(idempotency_key).strip():
+        raise BadRequestException("Idempotency-Key header is required")
+    key = str(idempotency_key).strip()
+    normalized_tags = sorted({str(t).strip().lower().replace(" ", "_") for t in (payload.tags or []) if str(t).strip()})
+    if "walk_in_customer" not in normalized_tags:
+        normalized_tags.append("walk_in_customer")
+    request_payload = payload.model_dump()
+    request_payload["tags"] = normalized_tags
+    replay = await IdempotencyService(db).begin_or_replay(
+        business_id=actor.business.id,
+        key=f"contacts:qr_optin:{key}",
+        payload=request_payload,
+    )
+    if replay is not None:
+        return replay
+
+    repo = ContactRepository(db)
+    row = await repo.upsert_contact(
+        business_id=actor.business.id,
+        phone_e164=payload.phone_e164.strip(),
+        wa_id=(payload.wa_id or "").strip() or None,
+        name=(payload.name or "").strip() or None,
+        email=None,
+        tags=normalized_tags,
+        custom_attributes={
+            "source": payload.source.strip().lower(),
+            "store_branch": payload.branch.strip(),
+            "qr_prefilled_message": payload.prefilled_message.strip().upper(),
+        },
+        source=payload.source.strip().lower(),
+    )
+    await repo.set_opt_in(
+        business_id=actor.business.id,
+        contact_id=row.id,
+        status="opted_in",
+        source=payload.source.strip().lower(),
+    )
+    db.add(
+        AuditLog(
+            business_id=actor.business.id,
+            user_id=actor.user.id,
+            actor_type="user",
+            actor_id=str(actor.user.id),
+            operation_id=key,
+            action="contact_qr_opt_in_capture",
+            resource_type="contact",
+            resource_id=str(row.id),
+            status="success",
+            details={
+                "source": payload.source.strip().lower(),
+                "branch": payload.branch.strip(),
+                "prefilled_message": payload.prefilled_message.strip().upper(),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    response = {
+        "status": "ok",
+        "contact_id": str(row.id),
+        "opt_in_status": row.opt_in_status,
+        "opt_in_source": row.opt_in_source,
+        "source": payload.source.strip().lower(),
+        "branch": payload.branch.strip(),
+        "tags": row.tags or [],
+    }
+    await IdempotencyService(db).finalize(
+        business_id=actor.business.id,
+        key=f"contacts:qr_optin:{key}",
+        response_json=response,
+    )
+    return response
+
+
+@router.post("/offline-registrations/capture", response_model=dict)
+async def capture_offline_registration(
+    payload: ContactOfflineRegistrationRequest,
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    actor: CurrentActor = Depends(require_permissions("contacts:write")),
+    db: AsyncSession = Depends(get_db),
+):
+    if not idempotency_key or not str(idempotency_key).strip():
+        raise BadRequestException("Idempotency-Key header is required")
+    key = str(idempotency_key).strip()
+    replay = await IdempotencyService(db).begin_or_replay(
+        business_id=actor.business.id,
+        key=f"contacts:offline_registration:{key}",
+        payload=payload.model_dump(mode="json"),
+    )
+    if replay is not None:
+        return replay
+
+    consent_yes = str(payload.consent_reply).upper() == "YES"
+    repo = ContactRepository(db)
+    tags = ["walk_in_customer", f"registration_{payload.registration_type}"]
+    if payload.product_purchased:
+        tags.append(f"product_{payload.product_purchased.strip().lower().replace(' ', '_')}")
+    custom_attributes = {
+        "source": "offline_counter_registration",
+        "store_branch": payload.branch.strip(),
+        "product_purchased": payload.product_purchased.strip() if payload.product_purchased else None,
+        "purchase_date": payload.purchase_date.isoformat() if payload.purchase_date else None,
+        "warranty_until": payload.warranty_until.isoformat() if payload.warranty_until else None,
+        "service_reminder_at": payload.service_reminder_at.isoformat() if payload.service_reminder_at else None,
+        "registration_type": payload.registration_type,
+        "consent_reply": payload.consent_reply,
+        "future_campaign_eligible": consent_yes,
+    }
+    custom_attributes = {k: v for k, v in custom_attributes.items() if v is not None}
+    row = await repo.upsert_contact(
+        business_id=actor.business.id,
+        phone_e164=payload.phone_e164.strip(),
+        wa_id=None,
+        name=(payload.name or "").strip() or None,
+        email=None,
+        tags=tags,
+        custom_attributes=custom_attributes,
+        source="offline_counter_registration",
+    )
+    await repo.set_opt_in(
+        business_id=actor.business.id,
+        contact_id=row.id,
+        status="opted_in" if consent_yes else "unknown",
+        source="offline_counter_registration",
+    )
+    db.add(
+        AuditLog(
+            business_id=actor.business.id,
+            user_id=actor.user.id,
+            actor_type="user",
+            actor_id=str(actor.user.id),
+            operation_id=key,
+            action="contact_offline_registration_capture",
+            resource_type="contact",
+            resource_id=str(row.id),
+            status="success",
+            details={
+                "registration_type": payload.registration_type,
+                "branch": payload.branch.strip(),
+                "consent_reply": payload.consent_reply,
+                "future_campaign_eligible": consent_yes,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    response = {
+        "status": "ok",
+        "contact_id": str(row.id),
+        "registration_type": payload.registration_type,
+        "opt_in_status": row.opt_in_status,
+        "future_campaign_eligible": consent_yes,
+        "tags": row.tags or [],
+    }
+    await IdempotencyService(db).finalize(
+        business_id=actor.business.id,
+        key=f"contacts:offline_registration:{key}",
+        response_json=response,
+    )
+    return response
+
+
 @router.patch("/{contact_id}", response_model=ContactResponse)
 async def update_contact(
     contact_id: str,
@@ -1237,7 +1751,6 @@ async def update_contact(
 ):
     row = await ContactRepository(db).get_by_id_for_business(actor.business.id, uuid.UUID(contact_id))
     if not row:
-        from app.core.exceptions import NotFoundException
         raise NotFoundException("Contact not found")
     if payload.name is not None:
         row.display_name = str(payload.name).strip() or None

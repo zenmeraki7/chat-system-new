@@ -1,8 +1,12 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 import os
+from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine, Base
@@ -16,6 +20,7 @@ from app.api.v1 import (
     commerce,
     contacts,
     conversations,
+    google_sheets_integrations,
     public,
     realtime,
     templates,
@@ -31,6 +36,7 @@ from app.services.campaign_scheduler_worker import CampaignSchedulerWorker
 from app.services.billing_finalizer_worker import BillingFinalizerWorker
 from app.services.contact_import_worker import ContactImportWorker
 from app.services.contact_export_worker import ContactExportWorker
+from app.services.campaign_export_worker import CampaignExportWorker
 from app.services.message_send_worker import MessageSendWorker
 from app.services.webhook_status_worker import WebhookStatusWorker
 from app.services.webhook_outbox_consumer import WebhookOutboxConsumer
@@ -43,6 +49,7 @@ from app.services.object_storage_service import object_storage_service
 from app.services.template_sync_reconcile_worker import TemplateSyncReconcileWorker
 from app.services.whatsapp_onboarding_health_reconcile_worker import WhatsAppOnboardingHealthReconcileWorker
 from app.services.bulk_job_worker import BulkJobWorker
+from app.core.api_error import build_api_error, normalize_http_exception
 
 
 def _validate_startup_configuration() -> None:
@@ -70,6 +77,7 @@ async def lifespan(app: FastAPI):
     outbound_worker = OutboundSendWorker()
     contact_import_worker = ContactImportWorker()
     contact_export_worker = ContactExportWorker()
+    campaign_export_worker = CampaignExportWorker()
     campaign_scheduler_worker = CampaignSchedulerWorker()
     campaign_dispatch_worker = CampaignDispatchWorker()
     campaign_batch_dispatch_worker = CampaignBatchDispatchWorker()
@@ -90,6 +98,7 @@ async def lifespan(app: FastAPI):
     await outbound_worker.start()
     await contact_import_worker.start()
     await contact_export_worker.start()
+    await campaign_export_worker.start()
     await campaign_scheduler_worker.start()
     await campaign_dispatch_worker.start()
     await campaign_batch_dispatch_worker.start()
@@ -125,6 +134,7 @@ async def lifespan(app: FastAPI):
     await campaign_scheduler_worker.stop()
     await contact_import_worker.stop()
     await contact_export_worker.stop()
+    await campaign_export_worker.stop()
     await outbound_worker.stop()
     await webhook_consumer.stop()
     await engine.dispose()
@@ -138,6 +148,37 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(HTTPException)
+async def api_http_exception_handler(request: Request, exc: HTTPException):
+    request_id = request.headers.get("x-request-id")
+    payload = normalize_http_exception(exc, request_id=request_id)
+    return JSONResponse(status_code=exc.status_code, content=payload)
+
+
+@app.exception_handler(RequestValidationError)
+async def api_validation_exception_handler(request: Request, exc: RequestValidationError):
+    request_id = request.headers.get("x-request-id")
+    payload = build_api_error(
+        code="VALIDATION_ERROR",
+        user_message="Request validation failed",
+        request_id=request_id,
+        retryable=False,
+    )
+    return JSONResponse(status_code=422, content=payload)
+
+
+@app.exception_handler(Exception)
+async def api_unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = request.headers.get("x-request-id")
+    payload = build_api_error(
+        code="INTERNAL_SERVER_ERROR",
+        user_message="Something went wrong. Contact support with request ID.",
+        request_id=request_id,
+        retryable=False,
+    )
+    return JSONResponse(status_code=500, content=payload)
 
 # CORS
 app.add_middleware(
@@ -166,6 +207,7 @@ app.include_router(automations.router, prefix=settings.API_V1_STR)
 app.include_router(commerce.router, prefix=settings.API_V1_STR)
 app.include_router(analytics.router, prefix=settings.API_V1_STR)
 app.include_router(admin_support.router, prefix=settings.API_V1_STR)
+app.include_router(google_sheets_integrations.router, prefix=settings.API_V1_STR)
 app.include_router(realtime.router, prefix=settings.API_V1_STR)
 app.include_router(public.router, prefix=settings.API_V1_STR)
 app.include_router(whatsapp.router, prefix=settings.API_V1_STR)
@@ -176,6 +218,63 @@ app.include_router(websocket.router)
 @app.get("/", tags=["Health"])
 async def health_check():
     return {"status": "ok", "app": settings.APP_NAME, "version": "1.0.0"}
+
+
+@app.get("/readiness/cursor-indexes", tags=["Health"])
+async def cursor_indexes_readiness():
+    required_indexes = {
+        "idx_contacts_business_updated_id",
+        "idx_conversations_business_updated_id",
+        "idx_messages_business_conversation_created_id",
+        "idx_campaign_recipients_campaign_status_id",
+    }
+    query = text(
+        """
+        SELECT
+            cls.relname AS index_name,
+            idx.indisvalid AS is_valid,
+            idx.indisready AS is_ready
+        FROM pg_class cls
+        JOIN pg_index idx ON idx.indexrelid = cls.oid
+        JOIN pg_namespace nsp ON nsp.oid = cls.relnamespace
+        WHERE nsp.nspname = ANY (current_schemas(false))
+          AND cls.relname = ANY (:required_indexes)
+        """
+    )
+    async with engine.connect() as conn:
+        rows = await conn.execute(query, {"required_indexes": list(required_indexes)})
+        observed = {
+            str(row[0]): {
+                "is_valid": bool(row[1]),
+                "is_ready": bool(row[2]),
+            }
+            for row in rows.fetchall()
+        }
+
+    missing = sorted(required_indexes - set(observed.keys()))
+    invalid_or_unready = sorted(
+        [
+            index_name
+            for index_name, status in observed.items()
+            if not status["is_valid"] or not status["is_ready"]
+        ]
+    )
+    if missing or invalid_or_unready:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "CURSOR_INDEXES_MISSING",
+                "message": "Required cursor indexes are missing or not ready in target database",
+                "missingIndexes": missing,
+                "invalidOrUnreadyIndexes": invalid_or_unready,
+            },
+        )
+
+    return {
+        "status": "ready",
+        "checkedIndexes": sorted(required_indexes),
+        "indexStatuses": observed,
+    }
 
 
 @app.get("/widget.js", tags=["Widget"])

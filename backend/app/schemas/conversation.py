@@ -104,7 +104,7 @@ class ReopenConversationRequest(BaseModel):
 class AssignConversationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    assigned_user_id: uuid.UUID | None = None
+    assignee_public_id: uuid.UUID | None = None
     assigned_team_id: uuid.UUID | None = None
 
 

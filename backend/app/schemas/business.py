@@ -19,25 +19,29 @@ class MetaOAuthCallbackRequest(BaseModel):
 
     code: str = Field(min_length=10, max_length=2048)
     state: str = Field(min_length=20, max_length=512)
-    waba_id: Optional[str] = Field(default=None, min_length=1, max_length=64, pattern=r"^\d+$")
-    phone_number_id: Optional[str] = Field(default=None, min_length=1, max_length=64, pattern=r"^\d+$")
 
 
 class WhatsAppOnboardingStatusResponse(BaseModel):
-    integration_status: str
+    onboarding_state: str
     business_id: uuid.UUID
     waba_id: Optional[str] = None
     phone_number_id: Optional[str] = None
     display_phone_number: Optional[str] = None
     verified_name: Optional[str] = None
-    quality_rating: Optional[str] = None
+    display_name_status: Optional[str] = None
+    business_verification_status: Optional[str] = None
+    phone_number_quality_rating: Optional[str] = None
     messaging_limit_tier: Optional[str] = None
     currency: Optional[str] = None
     timezone: Optional[str] = None
-    verification_status: Optional[str] = None
+    cloud_api_registered: bool = False
+    two_step_verification_required: bool = False
+    webhook_subscribed: bool = False
+    test_message_passed: bool = False
     permissions_granted: list[str] = []
     token_expires_at: Optional[datetime] = None
     token_valid: bool = False
+    blocking_reasons: list[dict] = []
 
 
 class WhatsAppOnboardingProbeRequest(BaseModel):

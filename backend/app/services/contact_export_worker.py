@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import csv
-import io
 import logging
+import os
+import tempfile
 import uuid
 from datetime import datetime, timezone
 
@@ -12,10 +13,12 @@ from sqlalchemy import and_, or_, select
 from app.database import AsyncSessionLocal
 from app.models.business_domains import Contact, ContactExportJob, OutboxEvent, QuerySnapshot, ConversationSavedView
 from app.services.contact_segment_service import ContactSegmentService
+from app.services.csv_safety import escape_csv_cell
 from app.services.degradation_mode_service import should_defer_domain
 from app.services.object_storage_service import object_storage_service
 
 logger = logging.getLogger(__name__)
+EXPORT_CHUNK_SIZE = 500
 
 
 class ContactExportWorker:
@@ -162,7 +165,7 @@ class ContactExportWorker:
                     Contact.deleted_at.is_(None),
                 )
 
-                if str(job.selection_mode or "").lower() == "all_matching_query" and job.query_snapshot_id is not None:
+                if str(job.selection_mode or "").lower() in {"all_matching_query", "snapshot"} and job.query_snapshot_id is not None:
                     snapshot = (
                         await db.execute(
                             select(QuerySnapshot).where(
@@ -191,7 +194,6 @@ class ContactExportWorker:
                 elif selected_ids:
                     stmt = stmt.where(Contact.id.in_(selected_ids))
 
-                rows = (await db.execute(stmt.order_by(Contact.updated_at.desc(), Contact.id.desc()))).scalars().all()
                 columns = [str(c).strip() for c in (job.columns_json or []) if str(c).strip()]
                 allowed_columns = {
                     "contact_id": lambda r: str(r.id),
@@ -209,20 +211,38 @@ class ContactExportWorker:
                 if not columns:
                     columns = ["contact_id", "name", "email", "phone_e164", "wa_id", "opt_in_status", "tags", "updated_at"]
 
-                buf = io.StringIO()
-                writer = csv.writer(buf)
-                writer.writerow(columns)
-                for row in rows:
-                    writer.writerow([allowed_columns[c](row) for c in columns])
+                row_count = 0
+                temp_path = ""
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", newline="", encoding="utf-8", delete=False) as tmp:
+                        temp_path = tmp.name
+                        writer = csv.writer(tmp)
+                        writer.writerow([escape_csv_cell(c) for c in columns])
+                        stream = await db.stream(
+                            stmt.order_by(Contact.updated_at.desc(), Contact.id.desc()).execution_options(yield_per=EXPORT_CHUNK_SIZE)
+                        )
+                        async for row in stream.scalars():
+                            writer.writerow([escape_csv_cell(allowed_columns[c](row)) for c in columns])
+                            row_count += 1
+                            if row_count % EXPORT_CHUNK_SIZE == 0:
+                                # Progress moves from 35 -> 95 while chunking rows.
+                                job.progress = min(95, 35 + int(row_count / EXPORT_CHUNK_SIZE))
+                                await db.flush()
+                    key = object_storage_service.put_file(
+                        namespace="contact_exports",
+                        filename_hint=f"contacts_{job.business_id}.csv",
+                        source_path=temp_path,
+                    )
+                finally:
+                    if temp_path:
+                        try:
+                            os.unlink(temp_path)
+                        except OSError:
+                            pass
 
-                key = object_storage_service.put_bytes(
-                    namespace="contact_exports",
-                    filename_hint=f"contacts_{job.business_id}.csv",
-                    content=buf.getvalue().encode("utf-8"),
-                )
                 job.storage_key = key
                 job.download_url = object_storage_service.build_url(key)
-                job.total_rows = len(rows)
+                job.total_rows = row_count
                 job.progress = 100
                 job.status = "completed"
                 job.error_code = None

@@ -1,7 +1,6 @@
 from typing import List
 from datetime import datetime, timezone, timedelta
 from uuid import UUID
-import base64
 from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy import and_, delete, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +28,7 @@ from app.repositories.message_repo import MessageRepository
 from app.api.deps import CurrentActor, require_permissions
 from app.core.exceptions import NotFoundException, ForbiddenException
 from app.services.conversation_service import ConversationService
+from app.utils.cursor import decode_cursor, encode_cursor, InvalidCursorError, stable_hash
 from app.models.business_domains import (
     ConversationTag,
     InternalNote,
@@ -38,27 +38,11 @@ from app.models.business_domains import (
     ConversationAssignment,
     ConversationStatusEvent,
     ConversationEvent,
+    BusinessMembership,
+    User,
 )
 
 router = APIRouter(prefix="/conversations", tags=["Conversations"])
-
-
-def _encode_conversation_cursor(last_message_at: datetime, conversation_id: UUID) -> str:
-    # Cursor format: "<iso8601>|<uuid>" encoded as URL-safe base64.
-    raw = f"{last_message_at.astimezone(timezone.utc).isoformat()}|{conversation_id}"
-    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("utf-8")
-
-
-def _decode_conversation_cursor(cursor: str) -> tuple[datetime, UUID] | None:
-    try:
-        decoded = base64.urlsafe_b64decode(cursor.encode("utf-8")).decode("utf-8")
-        ts_raw, id_raw = decoded.split("|", 1)
-        ts = datetime.fromisoformat(ts_raw)
-        if ts.tzinfo is None:
-            ts = ts.replace(tzinfo=timezone.utc)
-        return (ts.astimezone(timezone.utc), UUID(id_raw))
-    except Exception:
-        return None
 
 
 @router.get("", response_model=dict)
@@ -73,13 +57,39 @@ async def list_conversations(
     actor: CurrentActor = Depends(require_permissions("conversations:read")),
     db: AsyncSession = Depends(get_db),
 ):
+    query_fingerprint = stable_hash(
+        {
+            "resource": "conversations",
+            "businessId": str(actor.business.id),
+            "status": status or "",
+            "assigned_user_id": str(assigned_user_id) if assigned_user_id else "",
+            "priority": priority or "",
+            "tag": tag or "",
+            "search": (search or "").strip().lower(),
+            "sort": {"key": "last_message_at", "dir": "desc"},
+        }
+    )
     cursor_last_message_at: datetime | None = None
     cursor_id: UUID | None = None
     if cursor:
-        parsed_cursor = _decode_conversation_cursor(cursor)
-        if parsed_cursor is None:
-            raise HTTPException(status_code=400, detail="Invalid cursor")
-        cursor_last_message_at, cursor_id = parsed_cursor
+        try:
+            payload = decode_cursor(cursor)
+            if payload.get("resource") != "conversations":
+                raise InvalidCursorError("Cursor resource mismatch")
+            if str(payload.get("businessId")) != str(actor.business.id):
+                raise InvalidCursorError("Cursor business mismatch")
+            if payload.get("queryFingerprint") != query_fingerprint:
+                raise InvalidCursorError("CURSOR_QUERY_MISMATCH")
+            raw_value = payload.get("sortValue")
+            if raw_value is None:
+                raise InvalidCursorError("Missing cursor sort value")
+            parsed_ts = datetime.fromisoformat(str(raw_value))
+            if parsed_ts.tzinfo is None:
+                parsed_ts = parsed_ts.replace(tzinfo=timezone.utc)
+            cursor_last_message_at = parsed_ts.astimezone(timezone.utc)
+            cursor_id = UUID(str(payload.get("id")))
+        except (InvalidCursorError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail={"code": "INVALID_CURSOR", "message": str(exc)}) from exc
 
     repo = ConversationRepository(db)
     fetch_limit = max(1, min(limit, 100)) + 1
@@ -101,7 +111,17 @@ async def list_conversations(
     if has_more and page_rows:
         last = page_rows[-1]
         if last.last_message_at is not None:
-            next_cursor = _encode_conversation_cursor(last.last_message_at, last.id)
+            next_cursor = encode_cursor(
+                {
+                    "resource": "conversations",
+                    "businessId": str(actor.business.id),
+                    "queryFingerprint": query_fingerprint,
+                    "sortKey": "last_message_at",
+                    "sortDir": "desc",
+                    "sortValue": last.last_message_at.astimezone(timezone.utc).isoformat(),
+                    "id": str(last.id),
+                }
+            )
 
     msg_repo = MessageRepository(db)
     result = []
@@ -131,7 +151,11 @@ async def list_conversations(
                 updated_at=conv.updated_at,
             )
         )
-    return {"items": [row.model_dump() for row in result], "next_cursor": next_cursor}
+    return {
+        "items": [row.model_dump() for row in result],
+        "next_cursor": next_cursor,
+        "query_fingerprint": query_fingerprint,
+    }
 
 
 @router.get("/{conversation_id}", response_model=ConversationDetailResponse)
@@ -172,48 +196,85 @@ async def get_messages(
     actor: CurrentActor = Depends(require_permissions("conversations:read")),
     db: AsyncSession = Depends(get_db),
 ):
+    conversation_uuid = UUID(conversation_id)
     conv_repo = ConversationRepository(db)
-    conv = await conv_repo.get_for_business(actor.business.id, UUID(conversation_id))
+    conv = await conv_repo.get_for_business(actor.business.id, conversation_uuid)
     if not conv:
         raise NotFoundException("Conversation not found")
     if conv.business_id != actor.business.id:
         raise ForbiddenException()
 
     from app.models.message import Message
+    normalized_sort_by = "created_at" if sort_by == "created_at" else "updated_at"
+    normalized_sort_dir = "asc" if str(sort_dir).lower() == "asc" else "desc"
+    query_fingerprint = stable_hash(
+        {
+            "resource": "conversation_messages",
+            "businessId": str(actor.business.id),
+            "conversationId": str(conversation_uuid),
+            "search": (search or "").strip().lower(),
+            "sort": {"key": normalized_sort_by, "dir": normalized_sort_dir},
+        }
+    )
     stmt = select(Message).where(
         Message.business_id == actor.business.id,
-        Message.conversation_id == UUID(conversation_id),
+        Message.conversation_id == conversation_uuid,
         Message.deleted_at.is_(None),
     )
     if search:
         q = f"%{search.strip()}%"
         stmt = stmt.where(or_(Message.content_text.ilike(q), Message.content.ilike(q), Message.message_kind.ilike(q)))
-    sort_key = Message.created_at if sort_by == "created_at" else Message.updated_at
-    sort_desc = str(sort_dir).lower() != "asc"
+    sort_key = Message.created_at if normalized_sort_by == "created_at" else Message.updated_at
+    sort_desc = normalized_sort_dir != "asc"
     if cursor:
-        cursor_row = (
-            await db.execute(
-                select(Message.id, sort_key).where(
-                    Message.id == UUID(cursor),
-                    Message.business_id == actor.business.id,
-                    Message.conversation_id == UUID(conversation_id),
-                    Message.deleted_at.is_(None),
-                )
-            )
-        ).first()
-        if cursor_row is not None:
-            cursor_id, cursor_val = cursor_row
-            if cursor_val is not None:
-                if sort_desc:
-                    stmt = stmt.where(or_(sort_key < cursor_val, and_(sort_key == cursor_val, Message.id < cursor_id)))
-                else:
-                    stmt = stmt.where(or_(sort_key > cursor_val, and_(sort_key == cursor_val, Message.id > cursor_id)))
+        try:
+            payload = decode_cursor(cursor)
+            if payload.get("resource") != "conversation_messages":
+                raise InvalidCursorError("Cursor resource mismatch")
+            if str(payload.get("businessId")) != str(actor.business.id):
+                raise InvalidCursorError("Cursor business mismatch")
+            if str(payload.get("conversationId")) != str(conversation_uuid):
+                raise InvalidCursorError("Cursor conversation mismatch")
+            if payload.get("queryFingerprint") != query_fingerprint:
+                raise InvalidCursorError("CURSOR_QUERY_MISMATCH")
+            if payload.get("sortKey") != normalized_sort_by or payload.get("sortDir") != normalized_sort_dir:
+                raise InvalidCursorError("CURSOR_QUERY_MISMATCH")
+            cursor_id = UUID(str(payload.get("id")))
+            cursor_val = payload.get("sortValue")
+            if cursor_val is None:
+                raise InvalidCursorError("Missing cursor sort value")
+            cursor_dt = datetime.fromisoformat(str(cursor_val))
+            if cursor_dt.tzinfo is None:
+                cursor_dt = cursor_dt.replace(tzinfo=timezone.utc)
+            cursor_val = cursor_dt.astimezone(timezone.utc)
+            if sort_desc:
+                stmt = stmt.where(or_(sort_key < cursor_val, and_(sort_key == cursor_val, Message.id < cursor_id)))
+            else:
+                stmt = stmt.where(or_(sort_key > cursor_val, and_(sort_key == cursor_val, Message.id > cursor_id)))
+        except (InvalidCursorError, ValueError) as exc:
+            code = "CURSOR_QUERY_MISMATCH" if "MISMATCH" in str(exc).upper() else "INVALID_CURSOR"
+            raise HTTPException(status_code=400, detail={"code": code, "message": str(exc)}) from exc
     total = int((await db.execute(select(func.count()).select_from(stmt.subquery()))).scalar_one() or 0)
     order_primary = sort_key.desc() if sort_desc else sort_key.asc()
     order_secondary = Message.id.desc() if sort_desc else Message.id.asc()
     messages = (await db.execute(stmt.order_by(order_primary, order_secondary).limit(limit + 1))).scalars().all()
     page_rows = messages[:limit]
-    next_cursor = str(page_rows[-1].id) if len(messages) > limit and page_rows else None
+    next_cursor = None
+    if len(messages) > limit and page_rows:
+        last = page_rows[-1]
+        sort_value = last.created_at if normalized_sort_by == "created_at" else last.updated_at
+        next_cursor = encode_cursor(
+            {
+                "resource": "conversation_messages",
+                "businessId": str(actor.business.id),
+                "conversationId": str(conversation_uuid),
+                "queryFingerprint": query_fingerprint,
+                "sortKey": normalized_sort_by,
+                "sortDir": normalized_sort_dir,
+                "sortValue": sort_value.astimezone(timezone.utc).isoformat() if sort_value else None,
+                "id": str(last.id),
+            }
+        )
     items = [
         AgentMessageResponse(
             public_id=message.id,
@@ -232,7 +293,12 @@ async def get_messages(
         )
         for message in page_rows
     ]
-    return {"items": [row.model_dump() for row in items], "next_cursor": next_cursor, "total": total}
+    return {
+        "items": [row.model_dump() for row in items],
+        "next_cursor": next_cursor,
+        "total": total,
+        "query_fingerprint": query_fingerprint,
+    }
 
 
 @router.patch("/{conversation_id}/profile", response_model=ConversationDetailResponse)
@@ -329,14 +395,38 @@ async def assign_conversation(
     actor: CurrentActor = Depends(require_permissions("conversations:write")),
     db: AsyncSession = Depends(get_db),
 ):
-    if payload.assigned_user_id is None and payload.assigned_team_id is None:
-        raise HTTPException(status_code=400, detail="assigned_user_id or assigned_team_id is required")
+    if payload.assignee_public_id is None and payload.assigned_team_id is None:
+        raise HTTPException(status_code=400, detail="assignee_public_id or assigned_team_id is required")
+    resolved_assignee_id: UUID | None = None
+    if payload.assignee_public_id is not None:
+        assignee_membership = (
+            await db.execute(
+                select(BusinessMembership)
+                .join(User, User.id == BusinessMembership.user_id)
+                .where(
+                    BusinessMembership.business_id == actor.business.id,
+                    BusinessMembership.user_id == payload.assignee_public_id,
+                    BusinessMembership.status == "active",
+                    BusinessMembership.deleted_at.is_(None),
+                    User.deleted_at.is_(None),
+                    User.status == "active",
+                )
+            )
+        ).scalar_one_or_none()
+        if assignee_membership is None:
+            raise HTTPException(status_code=400, detail="Assignee is not an active member of this business")
+        assignee_permissions = {perm.permission_code for perm in (assignee_membership.role.permissions or [])}
+        if assignee_membership.role.code == "owner":
+            assignee_permissions.add("*")
+        if "*" not in assignee_permissions and "conversations:read" not in assignee_permissions and "conversations:write" not in assignee_permissions:
+            raise HTTPException(status_code=400, detail="Assignee lacks inbox permission")
+        resolved_assignee_id = payload.assignee_public_id
     svc = ConversationService(db)
     conv = await svc.assign(
         business_id=actor.business.id,
         conversation_id=UUID(conversation_id),
         actor_user_id=actor.user.id,
-        assigned_user_id=payload.assigned_user_id,
+        assigned_user_id=resolved_assignee_id,
         assigned_team_id=payload.assigned_team_id,
     )
     count = await MessageRepository(db).count_by_conversation(actor.business.id, conv.id)
@@ -352,6 +442,45 @@ async def assign_conversation(
         created_at=conv.created_at,
         updated_at=conv.updated_at,
     )
+
+
+@router.get("/team/members", response_model=dict)
+async def list_team_members_for_assignment(
+    role: str | None = Query(default="agent"),
+    active: bool = Query(default=True),
+    actor: CurrentActor = Depends(require_permissions("conversations:read")),
+    db: AsyncSession = Depends(get_db),
+):
+    del role
+    stmt = (
+        select(BusinessMembership, User)
+        .join(User, User.id == BusinessMembership.user_id)
+        .where(
+            BusinessMembership.business_id == actor.business.id,
+            BusinessMembership.deleted_at.is_(None),
+            User.deleted_at.is_(None),
+        )
+    )
+    if active:
+        stmt = stmt.where(BusinessMembership.status == "active", User.status == "active")
+    rows = (await db.execute(stmt)).all()
+    items: list[dict] = []
+    for membership, user in rows:
+        permissions = {perm.permission_code for perm in (membership.role.permissions or [])}
+        if membership.role.code == "owner":
+            permissions.add("*")
+        if "*" not in permissions and "conversations:read" not in permissions and "conversations:write" not in permissions:
+            continue
+        items.append(
+            {
+                "public_id": str(user.id),
+                "name": str(user.email).split("@")[0],
+                "email": user.email,
+                "role": membership.role.code,
+                "active": membership.status == "active" and user.status == "active",
+            }
+        )
+    return {"items": items}
 
 
 @router.post("/sla-policies", response_model=dict)

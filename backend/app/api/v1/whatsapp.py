@@ -177,10 +177,6 @@ async def get_whatsapp_onboarding_status(
     actor: CurrentActor = Depends(require_permissions("whatsapp:connect")),
 ):
     business = actor.business
-    integration_res = await db.execute(
-        select(WhatsAppIntegration).where(WhatsAppIntegration.business_id == business.id)
-    )
-    integration = integration_res.scalar_one_or_none()
     waba_res = await db.execute(
         select(WhatsAppBusinessAccount)
         .where(WhatsAppBusinessAccount.business_id == business.id)
@@ -206,6 +202,27 @@ async def get_whatsapp_onboarding_status(
         .order_by(OAuthCredential.created_at.desc())
     )
     cred = cred_res.scalars().first()
+    subscription_res = await db.execute(
+        select(WebhookSubscription)
+        .where(
+            WebhookSubscription.business_id == business.id,
+            WebhookSubscription.provider == "whatsapp",
+            WebhookSubscription.deleted_at.is_(None),
+        )
+        .order_by(WebhookSubscription.created_at.desc())
+    )
+    subscription = subscription_res.scalars().first()
+    probe_res = await db.execute(
+        select(MessageOutbox)
+        .where(
+            MessageOutbox.business_id == business.id,
+            MessageOutbox.source_type == "onboarding_probe",
+            MessageOutbox.deleted_at.is_(None),
+        )
+        .order_by(MessageOutbox.created_at.desc())
+        .limit(1)
+    )
+    latest_probe = probe_res.scalars().first()
     token_valid = False
     if cred is not None:
         try:
@@ -223,21 +240,83 @@ async def get_whatsapp_onboarding_status(
                     token_valid = bool((debug_resp.json().get("data") or {}).get("is_valid"))
         except Exception:
             token_valid = False
+    display_name_status = (phone.verification_status if phone else None)
+    business_verification_status = "approved" if waba else "pending"
+    cloud_api_registered = bool(phone and phone.phone_number_id)
+    two_step_verification_required = not cloud_api_registered
+    webhook_subscribed = bool(
+        subscription
+        and str(subscription.status or "").lower() == "active"
+        and _has_messages_field(subscription.subscribed_fields or [])
+    )
+    test_message_passed = bool(latest_probe and str(latest_probe.status or "").lower() in {"sent", "delivered", "read"})
+
+    blocking_reasons: list[dict] = []
+    if not token_valid:
+        blocking_reasons.append({
+            "code": "REAUTH_REQUIRED",
+            "title": "Access token is invalid or expired",
+            "recovery_action": "Reconnect WhatsApp to refresh the access token.",
+        })
+    if not phone:
+        blocking_reasons.append({
+            "code": "PHONE_NUMBER_DETECTED",
+            "title": "Phone number not attached",
+            "recovery_action": "Attach a sender number in embedded signup.",
+        })
+    if phone and str(phone.verification_status or "").lower() in {"pending", "unverified"}:
+        blocking_reasons.append({
+            "code": "PHONE_NUMBER_PENDING_VERIFICATION",
+            "title": "Phone verification is pending",
+            "recovery_action": "Complete phone verification in Meta Business Suite.",
+        })
+    if not webhook_subscribed:
+        blocking_reasons.append({
+            "code": "CLOUD_API_REGISTRATION_REQUIRED",
+            "title": "Messages webhook is not subscribed",
+            "recovery_action": "Subscribe webhook messages field and verify heartbeat.",
+        })
+    if cloud_api_registered and not test_message_passed:
+        blocking_reasons.append({
+            "code": "MESSAGE_TEST_REQUIRED",
+            "title": "Operational test message not confirmed",
+            "recovery_action": "Run the onboarding probe and verify delivery/read events.",
+        })
+
+    if not token_valid:
+        onboarding_state = "REAUTH_REQUIRED"
+    elif not phone:
+        onboarding_state = "PHONE_NUMBER_DETECTED"
+    elif str(phone.verification_status or "").lower() in {"pending", "unverified"}:
+        onboarding_state = "PHONE_NUMBER_PENDING_VERIFICATION"
+    elif not webhook_subscribed:
+        onboarding_state = "CLOUD_API_REGISTRATION_REQUIRED"
+    elif cloud_api_registered and not test_message_passed:
+        onboarding_state = "MESSAGE_TEST_REQUIRED"
+    else:
+        onboarding_state = "READY_TO_SEND"
+
     return WhatsAppOnboardingStatusResponse(
-        integration_status=(integration.status if integration else "disconnected"),
+        onboarding_state=onboarding_state,
         business_id=business.id,
         waba_id=(waba.waba_id if waba else None),
         phone_number_id=(phone.phone_number_id if phone else None),
         display_phone_number=(phone.display_phone_number if phone else None),
         verified_name=(phone.verified_name if phone else None),
-        quality_rating=(phone.quality_rating if phone else None),
+        display_name_status=display_name_status,
+        business_verification_status=business_verification_status,
+        phone_number_quality_rating=(phone.quality_rating if phone else None),
         messaging_limit_tier=(phone.messaging_limit_tier if phone else None),
         currency=(waba.currency if waba else None),
         timezone=(waba.timezone if waba else None),
-        verification_status=(phone.verification_status if phone else None),
+        cloud_api_registered=cloud_api_registered,
+        two_step_verification_required=two_step_verification_required,
+        webhook_subscribed=webhook_subscribed,
+        test_message_passed=test_message_passed,
         permissions_granted=(cred.scopes if cred else []),
         token_expires_at=(cred.expires_at if cred else None),
         token_valid=token_valid,
+        blocking_reasons=blocking_reasons,
     )
 
 
@@ -975,8 +1054,8 @@ async def connect_whatsapp(
 
     try:
         access_token = None
-        waba_id = payload.waba_id
-        phone_number_id = payload.phone_number_id
+        waba_id = None
+        phone_number_id = None
         permissions_granted: list[str] = []
         token_expires_at = None
         waba_profile: dict = {}

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import uuid
 from datetime import datetime, timezone
 from uuid import UUID
 from sqlalchemy import select
@@ -9,6 +12,7 @@ from app.core.exceptions import BadRequestException, ForbiddenException, NotFoun
 from app.models.business_domains import (
     Campaign,
     CampaignRecipient,
+    CampaignRecipientSnapshot,
     Contact,
     ContactImportJob,
     ContactImportRow,
@@ -25,6 +29,8 @@ from app.models.business_domains import CampaignRecipientEvent
 
 
 class CampaignRecipientSourceService:
+    FREEZE_FLUSH_BATCH_SIZE = 250
+
     def __init__(self, db: AsyncSession):
         self.db = db
         self.state = CampaignStateService(db)
@@ -128,6 +134,27 @@ class CampaignRecipientSourceService:
                 errs.append(f"missing_required_template_variable:{var}")
         return errs
 
+    def _build_freeze_summary(self, *, freeze_version: int, freeze_batch_id: str, total: int, eligible: int, skipped: int, errors: list[dict]) -> dict:
+        reason_counts: dict[str, int] = {}
+        for err in errors:
+            for reason in err.get("errors") or []:
+                key = str(reason)
+                reason_counts[key] = int(reason_counts.get(key, 0)) + 1
+        top_reasons = sorted(reason_counts.items(), key=lambda x: (-x[1], x[0]))[:20]
+        return {
+            "freeze_version": freeze_version,
+            "freeze_batch_id": freeze_batch_id,
+            "total_recipients": total,
+            "eligible_recipients": eligible,
+            "skipped_recipients": skipped,
+            "validation_error_count": len(errors),
+            "top_validation_reasons": [{"reason": k, "count": v} for k, v in top_reasons],
+        }
+
+    def _summary_hash(self, value: dict) -> str:
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
     async def finalize_and_freeze(self, *, business_id: UUID, campaign_id: UUID) -> dict:
         campaign = (
             await self.db.execute(
@@ -135,15 +162,30 @@ class CampaignRecipientSourceService:
                     Campaign.id == campaign_id,
                     Campaign.business_id == business_id,
                     Campaign.deleted_at.is_(None),
-                )
+                ).with_for_update()
             )
         ).scalar_one_or_none()
         if not campaign:
             raise NotFoundException("Campaign not found")
-        if campaign.status != "draft":
+        if campaign.status not in {"draft", "validating"}:
             raise BadRequestException("Campaign must be in DRAFT to finalize recipients")
         if not campaign.template_id:
             raise BadRequestException("Campaign template is required")
+        mapping = dict(campaign.variable_mapping_json or {})
+        finalize_lock = dict(mapping.get("__recipient_finalize_lock") or {})
+        if bool(finalize_lock.get("in_progress")):
+            raise BadRequestException("Recipient finalize already in progress for this campaign")
+        freeze_version = int(mapping.get("__recipient_freeze_version") or 0) + 1
+        freeze_batch_id = uuid.uuid4().hex
+        lock_token = uuid.uuid4().hex
+        now = datetime.now(timezone.utc)
+        mapping["__recipient_finalize_lock"] = {
+            "in_progress": True,
+            "started_at": now.isoformat(),
+            "token": lock_token,
+        }
+        campaign.variable_mapping_json = mapping
+        await self.db.flush()
 
         template = (
             await self.db.execute(
@@ -159,30 +201,55 @@ class CampaignRecipientSourceService:
         required_vars = self._required_template_variables(template)
         suppression_engine = ContactSuppressionEngine(self.db)
 
-        await self.state.transition_campaign(
-            business_id=business_id,
-            campaign_id=campaign_id,
-            new_status="validating",
-            reason="finalize_recipients",
-        )
+        if campaign.status == "draft":
+            await self.state.transition_campaign(
+                business_id=business_id,
+                campaign_id=campaign_id,
+                new_status="validating",
+                reason="finalize_recipients",
+            )
 
-        now = datetime.now(timezone.utc)
         seen_phones: set[str] = set()
         total = 0
         eligible = 0
         skipped = 0
         errors: list[dict] = []
 
-        # clear previous frozen recipients before freeze refresh
-        rows = await self.db.execute(
+        # clear previous active freeze recipients before creating the next freeze version
+        rows = await self.db.stream(
             select(CampaignRecipient).where(
                 CampaignRecipient.business_id == business_id,
                 CampaignRecipient.campaign_id == campaign_id,
                 CampaignRecipient.deleted_at.is_(None),
-            )
+            ).execution_options(yield_per=self.FREEZE_FLUSH_BATCH_SIZE)
         )
-        for row in rows.scalars().all():
+        async for row in rows.scalars():
             row.deleted_at = now
+
+        async def persist_recipient_batch(buffer: list[tuple[CampaignRecipient, list[str]]]) -> None:
+            if not buffer:
+                return
+            await self.db.flush()
+            for rec, errs in buffer:
+                if not errs:
+                    continue
+                self.db.add(
+                    CampaignRecipientEvent(
+                        campaign_id=campaign_id,
+                        campaign_recipient_id=rec.id,
+                        business_id=business_id,
+                        event_type="campaign_recipient.suppression_applied",
+                        old_status="pending",
+                        new_status="skipped",
+                        payload_json={"suppression_reasons": errs},
+                        error_code=errs[0],
+                        error_message="suppressed_by_policy",
+                    )
+                )
+            await self.db.flush()
+            buffer.clear()
+
+        recipient_buffer: list[tuple[CampaignRecipient, list[str]]] = []
 
         if campaign.segment_id:
             segment = (
@@ -200,8 +267,8 @@ class CampaignRecipientSourceService:
             segment_service = ContactSegmentService(self.db)
             stmt = select(Contact).where(Contact.business_id == business_id, Contact.deleted_at.is_(None))
             stmt = segment_service._apply_filters(stmt, filters)  # tenant-scoped and controlled input
-            contacts = (await self.db.execute(stmt)).scalars().all()
-            for c in contacts:
+            stream = await self.db.stream(stmt.execution_options(yield_per=self.FREEZE_FLUSH_BATCH_SIZE))
+            async for c in stream.scalars():
                 total += 1
                 variables = dict(c.custom_attributes or {})
                 decision = await suppression_engine.evaluate_for_campaign_recipient(
@@ -232,25 +299,17 @@ class CampaignRecipientSourceService:
                     eligibility_status=eligibility_status,
                     eligibility_reason=",".join(errs) if errs else None,
                     variables_json=variables,
-                    rendered_template_json={},
+                    rendered_template_json={
+                        "__freeze_batch_id": freeze_batch_id,
+                        "__freeze_version": freeze_version,
+                    },
                     skipped_at=now if errs else None,
                 )
                 self.db.add(rec)
-                await self.db.flush()
-                if errs:
-                    self.db.add(
-                        CampaignRecipientEvent(
-                            campaign_id=campaign_id,
-                            campaign_recipient_id=rec.id,
-                            business_id=business_id,
-                            event_type="campaign_recipient.suppression_applied",
-                            old_status="pending",
-                            new_status="skipped",
-                            payload_json={"suppression_reasons": errs},
-                            error_code=errs[0],
-                            error_message="suppressed_by_policy",
-                        )
-                    )
+                recipient_buffer.append((rec, errs))
+                if len(recipient_buffer) >= self.FREEZE_FLUSH_BATCH_SIZE:
+                    await persist_recipient_batch(recipient_buffer)
+            await persist_recipient_batch(recipient_buffer)
         elif campaign.csv_import_id:
             csv_job = (
                 await self.db.execute(
@@ -263,15 +322,13 @@ class CampaignRecipientSourceService:
             ).scalar_one_or_none()
             if not csv_job:
                 raise BadRequestException("CSV import not found")
-            csv_rows = (
-                await self.db.execute(
-                    select(ContactImportRow).where(
-                        ContactImportRow.import_job_id == csv_job.id,
-                        ContactImportRow.deleted_at.is_(None),
-                    )
-                )
-            ).scalars().all()
-            for row in csv_rows:
+            stream = await self.db.stream(
+                select(ContactImportRow).where(
+                    ContactImportRow.import_job_id == csv_job.id,
+                    ContactImportRow.deleted_at.is_(None),
+                ).execution_options(yield_per=self.FREEZE_FLUSH_BATCH_SIZE)
+            )
+            async for row in stream.scalars():
                 payload = row.payload_json or {}
                 total += 1
                 raw_phone = payload.get("phone_e164")
@@ -305,31 +362,49 @@ class CampaignRecipientSourceService:
                     eligibility_status=eligibility_status,
                     eligibility_reason=",".join(errs) if errs else None,
                     variables_json=variables,
-                    rendered_template_json={},
+                    rendered_template_json={
+                        "__freeze_batch_id": freeze_batch_id,
+                        "__freeze_version": freeze_version,
+                    },
                     skipped_at=now if errs else None,
                 )
                 self.db.add(rec)
-                await self.db.flush()
-                if errs:
-                    self.db.add(
-                        CampaignRecipientEvent(
-                            campaign_id=campaign_id,
-                            campaign_recipient_id=rec.id,
-                            business_id=business_id,
-                            event_type="campaign_recipient.suppression_applied",
-                            old_status="pending",
-                            new_status="skipped",
-                            payload_json={"suppression_reasons": errs},
-                            error_code=errs[0],
-                            error_message="suppressed_by_policy",
-                        )
-                    )
+                recipient_buffer.append((rec, errs))
+                if len(recipient_buffer) >= self.FREEZE_FLUSH_BATCH_SIZE:
+                    await persist_recipient_batch(recipient_buffer)
+            await persist_recipient_batch(recipient_buffer)
         else:
             raise BadRequestException("Campaign must have saved segment or CSV source")
+
+        summary = self._build_freeze_summary(
+            freeze_version=freeze_version,
+            freeze_batch_id=freeze_batch_id,
+            total=total,
+            eligible=eligible,
+            skipped=skipped,
+            errors=errors,
+        )
+        snapshot = CampaignRecipientSnapshot(
+            campaign_id=campaign_id,
+            recipient_set_hash=self._summary_hash(summary),
+            recipients=summary,
+        )
+        self.db.add(snapshot)
+        await self.db.flush()
 
         campaign.total_recipients = total
         campaign.eligible_recipients = eligible
         campaign.skipped_recipients = skipped
+        mapping = dict(campaign.variable_mapping_json or {})
+        mapping["__recipient_freeze_version"] = freeze_version
+        mapping["__active_recipient_freeze_batch_id"] = freeze_batch_id
+        mapping["__active_recipient_freeze_snapshot_id"] = str(snapshot.id)
+        mapping["__recipient_finalize_lock"] = {
+            "in_progress": False,
+            "released_at": datetime.now(timezone.utc).isoformat(),
+            "token": lock_token,
+        }
+        campaign.variable_mapping_json = mapping
         CampaignService.invalidate_preview(campaign)
         await self.state.transition_campaign(
             business_id=business_id,
@@ -342,11 +417,7 @@ class CampaignRecipientSourceService:
             campaign_id=campaign_id,
             event_type="recipients_frozen",
             message=f"{eligible:,} eligible recipients frozen ({total:,} total, {skipped:,} skipped)",
-            payload_json={
-                "total_recipients": total,
-                "eligible_recipients": eligible,
-                "skipped_recipients": skipped,
-            },
+            payload_json=summary,
         )
         await self.db.flush()
         return {
@@ -356,4 +427,7 @@ class CampaignRecipientSourceService:
             "eligible_recipients": eligible,
             "skipped_recipients": skipped,
             "validation_errors": errors,
+            "freeze_version": freeze_version,
+            "freeze_batch_id": freeze_batch_id,
+            "validation_summary_snapshot": summary,
         }

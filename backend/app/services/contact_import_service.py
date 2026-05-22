@@ -72,6 +72,22 @@ class ContactImportService:
                 error_count += 1
                 continue
             existing = await self.repo.find_by_phone_or_wa(business_id, phone, (row.get("wa_id") or None))
+            total_spend_raw = (row.get("total_spend") or "").strip()
+            total_spend_value = None
+            if total_spend_raw:
+                try:
+                    normalized_spend = total_spend_raw.replace(",", "")
+                    total_spend_value = float(normalized_spend)
+                except ValueError:
+                    total_spend_value = None
+            custom_attributes = {
+                "city": (row.get("city") or "").strip() or None,
+                "last_product": (row.get("last_product") or "").strip() or None,
+                "last_purchase_at": (row.get("last_purchase_at") or "").strip() or None,
+                "total_spend": total_spend_value,
+                "total_spend_raw": total_spend_raw or None,
+            }
+            custom_attributes = {k: v for k, v in custom_attributes.items() if v is not None}
             await self.repo.upsert_contact(
                 business_id=business_id,
                 phone_e164=phone,
@@ -79,7 +95,7 @@ class ContactImportService:
                 name=(row.get("name") or None),
                 email=((row.get("email") or "").strip().lower() or None),
                 tags=[t.strip().lower() for t in (row.get("tags") or "").split(",") if t.strip()],
-                custom_attributes={},
+                custom_attributes=custom_attributes,
                 source="csv_import",
             )
             import_row.status = "imported"
